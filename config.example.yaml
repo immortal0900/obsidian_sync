@@ -1,0 +1,24 @@
+watch_paths:
+  - path: ~/ObsidianVault
+    hooks: [sync]
+  # Future phases - uncomment and add hook implementations:
+  # - path: ~/ObsidianVault/blog
+  #   hooks: [sync, blog_convert]
+  # - path: ~/ObsidianVault/notes
+  #   hooks: [sync, llm_tagging]
+
+drive:
+  credentials_file: credentials.json   # OAuth2 client secret from Google Console
+  token_file: token.json               # auto-generated on first run
+  folder_id: YOUR_GOOGLE_DRIVE_FOLDER_ID_HERE
+
+sync:
+  debounce_seconds: 5
+  poll_interval_seconds: 60
+  delete_local: false   # true로 설정 시 Drive에서 삭제된 파일을 로컬에서도 삭제
+
+logging:
+  level: INFO      # DEBUG, INFO, WARNING, ERROR
+  file: obsidian_sync.log
+  max_bytes: 5242880   # 5 MB
+  backup_count: 3

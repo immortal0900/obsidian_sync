@@ -1,0 +1,25 @@
+# Python-generated files
+__pycache__/
+*.py[oc]
+build/
+dist/
+wheels/
+*.egg-info
+
+# Virtual environments
+.venv
+
+# Machine-specific config and secrets
+config.yaml
+credentials.json
+token.json
+
+# Runtime files
+drive_id_cache.json
+*.log
+*.log.*
+nssm.exe
+
+# IDE / tool settings
+.claude/
+.obsidian/
