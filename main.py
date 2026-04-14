@@ -13,8 +13,10 @@ Lifecycle:
 """
 from __future__ import annotations
 
+import atexit
 import logging
 import logging.handlers
+import os
 import signal
 import sys
 import time
@@ -24,6 +26,8 @@ import yaml
 
 from core.drive_sync import DriveSync
 from core.watcher import VaultWatcher
+
+LOCK_FILE = Path(__file__).parent / "daemon.lock"
 
 
 def load_config(path: str = "config.yaml") -> dict:
@@ -66,7 +70,28 @@ def setup_logging(config: dict) -> None:
     logging.basicConfig(level=level, format=fmt, handlers=handlers)
 
 
+def _acquire_lock() -> None:
+    """중복 실행 방지용 PID 락 파일."""
+    if LOCK_FILE.exists():
+        old_pid = LOCK_FILE.read_text().strip()
+        # 이전 프로세스가 아직 살아있는지 확인
+        try:
+            os.kill(int(old_pid), 0)
+            print(
+                f"ERROR: 데몬이 이미 실행 중입니다 (PID {old_pid}). "
+                "중복 실행을 방지합니다.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+        except (ProcessLookupError, ValueError, OSError):
+            pass  # 이전 프로세스가 죽었으면 락 파일 덮어쓰기
+
+    LOCK_FILE.write_text(str(os.getpid()))
+    atexit.register(lambda: LOCK_FILE.unlink(missing_ok=True))
+
+
 def main() -> None:
+    _acquire_lock()
     config = load_config()
     setup_logging(config)
     logger = logging.getLogger(__name__)

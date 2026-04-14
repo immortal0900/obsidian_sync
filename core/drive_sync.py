@@ -57,7 +57,9 @@ class DriveSync:
         self._service = None
         self._id_cache: dict[str, str] = {}  # rel_posix_path → drive_id
         self._cache_lock = threading.Lock()
+        self._upload_lock = threading.Lock()  # 동일 파일 중복 업로드 방지
 
+        self._debounce_seconds: float = config.get("sync", {}).get("debounce_seconds", 5)
         self._page_token: str | None = None
         self._poll_thread: threading.Thread | None = None
         self._stop_event = threading.Event()
@@ -170,8 +172,9 @@ class DriveSync:
             folder_id = self._cache_get(built)
 
             if not folder_id:
+                safe_name = part.replace("'", "\\'")
                 q = (
-                    f"name='{part}' and '{parent_id}' in parents "
+                    f"name='{safe_name}' and '{parent_id}' in parents "
                     f"and mimeType='{MIME_FOLDER}' and trashed=false"
                 )
                 resp = (
@@ -215,11 +218,14 @@ class DriveSync:
             logger.warning("Upload skipped, file gone: %s", local_path)
             return
 
+        # 업로드 락: 동일 파일에 대해 여러 스레드가 동시에 create() 하는 것을 방지
+        with self._upload_lock:
+            self._upload_file_locked(local_path)
+
+    def _upload_file_locked(self, local_path: Path) -> None:
         rel = self._rel(local_path)
-        parent_rel = str(Path(rel).parent)
-        parent_id = self._get_or_create_folder(
-            "" if parent_rel == "." else parent_rel
-        )
+        parent_rel = rel.rsplit("/", 1)[0] if "/" in rel else ""
+        parent_id = self._get_or_create_folder(parent_rel)
 
         media = googleapiclient.http.MediaFileUpload(
             str(local_path), resumable=False
@@ -256,8 +262,9 @@ class DriveSync:
 
         else:
             # Cache miss: query Drive in case the file already exists there
+            safe_name = local_path.name.replace("'", "\\'")
             q = (
-                f"name='{local_path.name}' and '{parent_id}' in parents "
+                f"name='{safe_name}' and '{parent_id}' in parents "
                 f"and trashed=false"
             )
             resp = (
@@ -315,10 +322,8 @@ class DriveSync:
             self.upload_file(dest_path)
             return
 
-        dest_parent_rel = str(Path(dest_rel).parent)
-        new_parent_id = self._get_or_create_folder(
-            "" if dest_parent_rel == "." else dest_parent_rel
-        )
+        dest_parent_rel = dest_rel.rsplit("/", 1)[0] if "/" in dest_rel else ""
+        new_parent_id = self._get_or_create_folder(dest_parent_rel)
 
         meta = (
             self._service.files()
@@ -485,7 +490,7 @@ class DriveSync:
                 logger.exception("Failed to delete local file: %s", local_path)
             finally:
                 def _remove_ignore(p: str) -> None:
-                    time.sleep(1.0)
+                    time.sleep(self._debounce_seconds + 1)
                     with self.ignore_lock:
                         self.ignore_paths.discard(p)
 
@@ -503,7 +508,7 @@ class DriveSync:
         Circular prevention:
         1. Add local_path to ignore_paths BEFORE writing to disk
         2. Write the file
-        3. Remove from ignore_paths after 1 second (absorbs delayed OS events)
+        3. Remove from ignore_paths after debounce+1초 (디바운스보다 길어야 재업로드 방지)
         """
         local_path.parent.mkdir(parents=True, exist_ok=True)
         path_str = str(local_path)
@@ -520,7 +525,7 @@ class DriveSync:
             logger.exception("Download failed: %s", local_path)
         finally:
             def _remove_ignore(p: str) -> None:
-                time.sleep(1.0)
+                time.sleep(self._debounce_seconds + 1)
                 with self.ignore_lock:
                     self.ignore_paths.discard(p)
 

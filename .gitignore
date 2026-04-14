@@ -16,6 +16,7 @@ token.json
 
 # Runtime files
 drive_id_cache.json
+daemon.lock
 *.log
 *.log.*
 nssm.exe
@@ -23,3 +24,4 @@ nssm.exe
 # IDE / tool settings
 .claude/
 .obsidian/
+지침1.md

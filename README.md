@@ -1,24 +1,42 @@
 # obsidian-sync
 
-로컬 Obsidian 볼트와 Google Drive 간 양방향 자동 동기화 데몬.
+로컬 Obsidian 볼트와 Google Drive 간 양방향 자동 동기화 프로그램.
+Obsidian이 꺼져 있어도 동작하는 독립 데몬입니다.
 
-- **로컬→Drive**: `watchdog`으로 파일 변경 감지 → Drive API로 업로드 (디바운싱 5초)
-- **Drive→로컬**: Changes API를 1분 간격 폴링 → 변경분 다운로드
-- **충돌 해결**: last-write-wins (마지막 수정 시간 기준)
-- **확장 가능**: 훅 시스템으로 Phase 2(blog_convert), Phase 3(llm_tagging) 추가 예정
+### 무엇을 하나요?
+
+```
+Obsidian 볼트 (내 PC)           Google Drive (클라우드)
+       │                               │
+       │  ── 파일 수정하면 자동 업로드 ──→  │
+       │                               │
+       │  ←── 다른 기기에서 바뀐 파일 다운로드 ──  │
+       │                               │
+       │  ── 파일 삭제하면 반대쪽도 삭제 ──→  │
+       │  ←──────────────────────────  │
+```
+
+- **로컬→Drive**: 파일 변경을 실시간 감지(`watchdog`) → 디바운싱 후 업로드
+- **Drive→로컬**: 적응형 폴링(10초~2분)으로 클라우드 변경 감지 → 다운로드
+- **충돌 시**: 양쪽 모두 보존 — `.conflict` 사본을 만들어서 내용이 절대 날아가지 않음
+- **삭제 전파**: 한쪽에서 지우면 반대쪽에서도 삭제 (설정으로 끌 수 있음)
 
 ---
 
-## 요구사항
+## 빠른 시작
 
-- Python 3.12
-- [uv](https://docs.astral.sh/uv/) 패키지 매니저
+> 처음 설정하는 분은 [SETUP_GUIDE.md](SETUP_GUIDE.md)에 스크린샷 포함 상세 가이드가 있습니다.
 
----
+### 1단계: 설치
 
-## 설치
+```bash
+git clone <repo-url>
+cd obsidian_sync
+uv sync                  # 의존성 설치 (uv 미설치 시 아래 참고)
+```
 
-### 1. uv 설치 (미설치 시)
+<details>
+<summary>uv가 없다면?</summary>
 
 **Windows (PowerShell):**
 ```powershell
@@ -29,134 +47,120 @@ powershell -c "irm https://astral.sh/uv/install.ps1 | iex"
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
 ```
+</details>
 
-### 2. 코드 받기
+### 2단계: Google Drive 연동
 
-```bash
-git clone <repo-url>
-cd obsidian_sync
-```
+1. [Google Cloud Console](https://console.cloud.google.com)에서 프로젝트 생성 + Drive API 활성화
+2. OAuth 클라이언트 ID (데스크톱 앱) 생성 → JSON 다운로드 → `credentials.json`으로 저장
+3. Google Drive에서 동기화할 폴더의 ID 복사:
+   ```
+   https://drive.google.com/drive/folders/1aBcDeFgHiJkLmNoPqRsT
+                                            └── 이 부분이 folder_id
+   ```
 
-### 3. 의존성 설치
+> 자세한 절차는 [SETUP_GUIDE.md](SETUP_GUIDE.md)의 "부록: Google Cloud 프로젝트 최초 설정" 참고
 
-```bash
-uv sync
-```
-
----
-
-## Google Drive 설정
-
-### 1. Google Cloud Console
-
-1. [console.cloud.google.com](https://console.cloud.google.com) → 새 프로젝트 생성 (예: `obsidian-sync`)
-2. **APIs & Services → Library** → `Google Drive API` 검색 → **Enable**
-
-### 2. OAuth 동의 화면
-
-1. **APIs & Services → OAuth consent screen**
-2. User type: **External**
-3. App name: `Obsidian Sync`, 본인 Gmail을 Test user로 추가
-4. Scopes: `https://www.googleapis.com/auth/drive` 추가
-
-### 3. 인증 정보 생성
-
-1. **APIs & Services → Credentials → Create Credentials → OAuth client ID**
-2. Application type: **Desktop app**
-3. 생성 후 JSON 다운로드 → `credentials.json`으로 이름 변경 → 프로젝트 루트에 복사
-
-### 4. Drive 폴더 ID 확인
-
-Google Drive 브라우저에서 동기화할 폴더 열기 → URL에서 ID 복사:
-```
-https://drive.google.com/drive/folders/[여기가_folder_id]
-```
-
----
-
-## 설정
+### 3단계: 설정 파일 작성
 
 ```bash
 cp config.example.yaml config.yaml
 ```
 
-`config.yaml` 편집:
+`config.yaml`을 열고 3가지만 수정:
 
 ```yaml
 watch_paths:
-  - path: C:/Users/YourName/ObsidianVault   # 실제 볼트 경로
+  - path: C:/Users/YourName/ObsidianVault   # <-- 내 볼트 경로
     hooks: [sync]
 
 drive:
   credentials_file: credentials.json
   token_file: token.json
-  folder_id: YOUR_GOOGLE_DRIVE_FOLDER_ID
+  folder_id: YOUR_FOLDER_ID                  # <-- 위에서 복사한 ID
 
 sync:
-  debounce_seconds: 5
-  poll_interval_seconds: 60
-  delete_local: false   # true로 설정 시 Drive 삭제가 로컬에도 반영됨
+  debounce_seconds: 5        # 파일 저장 후 5초 기다렸다가 업로드
+  poll_interval_seconds: 60  # 클라우드 변경을 60초마다 확인
+  delete_local: false        # true면 Drive에서 삭제 시 로컬도 삭제
 ```
 
----
-
-## 실행
-
-### 첫 실행 (OAuth 인증)
+### 4단계: 실행
 
 ```bash
 uv run python main.py
 ```
 
-브라우저가 열리면 Google 계정으로 로그인 → Drive 접근 허용 → `token.json` 자동 생성.
+첫 실행 시 브라우저가 열립니다 → Google 로그인 → Drive 접근 허용 → 완료!
+이후부터는 브라우저 없이 바로 시작됩니다.
 
-이후 실행부터는 브라우저 없이 자동 시작됩니다.
+```
+=== Obsidian Sync Daemon starting ===
+Google Drive service ready
+Daemon running. Press Ctrl+C to stop.
+```
 
-### 백그라운드 실행 (콘솔 창 없음)
+---
+
+## 다른 기기 추가
+
+이미 한 기기에서 동작 중이고, PC/노트북/서버 등 다른 기기를 추가하려면:
+
+```bash
+git clone <repo-url> && cd obsidian_sync && uv sync
+cp config.example.yaml config.yaml
+# config.yaml 편집 (이 기기의 볼트 경로 + 같은 folder_id)
+# credentials.json 복사 (기존 기기에서 가져오거나 Cloud Console에서 재다운로드)
+uv run python main.py   # 브라우저 OAuth 인증
+```
+
+단계별 상세 가이드: [SETUP_GUIDE.md](SETUP_GUIDE.md)
+
+### 기기별 파일 관리
+
+| 파일 | 기기 간 공유 | 설명 |
+|------|:-----------:|------|
+| `credentials.json` | O | OAuth 클라이언트 (모든 기기 동일) |
+| `config.yaml` | X | 볼트 경로가 기기마다 다름 |
+| `token.json` | X | 기기별 인증 토큰 (자동 생성) |
+
+> 위 파일은 모두 `.gitignore`에 포함되어 있어 git에 올라가지 않습니다.
+
+---
+
+## 백그라운드 실행 (선택)
+
+### 콘솔 창 없이 실행
 
 ```bash
 uv run pythonw main.py
 ```
 
----
-
-## 데몬 등록 (부팅 시 자동 실행)
-
-### Windows — 작업 스케줄러
-
-1. 작업 스케줄러 열기 → **작업 만들기** (기본 작업 아님)
-2. **일반** 탭: "사용자의 로그온 여부에 관계없이 실행", "가장 높은 수준의 권한으로 실행"
-3. **트리거** 탭: **시작할 때**
-4. **동작** 탭:
-   - 프로그램: `C:\01.project\obsidian_sync\.venv\Scripts\pythonw.exe`
-   - 인수: `C:\01.project\obsidian_sync\main.py`
-   - 시작 위치: `C:\01.project\obsidian_sync`
-5. **설정** 탭: "작업이 실패하면 다시 시작", 1분 간격, 최대 3회
-
-### Windows — NSSM (Windows 서비스)
-
-[nssm.cc](https://nssm.cc/download)에서 `nssm.exe` 다운로드 후:
+### 부팅 시 자동 실행 — Windows (NSSM 서비스)
 
 ```cmd
 nssm install ObsidianSync
 ```
 
-GUI에서:
-- Path: `.venv\Scripts\python.exe`
-- Arguments: `main.py`
-- Startup directory: `C:\01.project\obsidian_sync`
+| 항목 | 값 |
+|------|-----|
+| Path | `.venv\Scripts\python.exe` |
+| Arguments | `main.py` |
+| Startup directory | 프로젝트 폴더 경로 |
 
 ```cmd
-nssm start ObsidianSync
+nssm start ObsidianSync       # 시작
+nssm status ObsidianSync      # 상태 확인
+nssm restart ObsidianSync     # 재시작
 ```
 
-### Linux / macOS — systemd
+### 부팅 시 자동 실행 — Linux/macOS (systemd)
 
-`/etc/systemd/system/obsidian-sync.service` 생성:
+`/etc/systemd/system/obsidian-sync.service`:
 
 ```ini
 [Unit]
-Description=Obsidian Google Drive Sync Daemon
+Description=Obsidian Google Drive Sync
 After=network.target
 
 [Service]
@@ -165,43 +169,39 @@ User=yourusername
 WorkingDirectory=/path/to/obsidian_sync
 ExecStart=/path/to/obsidian_sync/.venv/bin/python main.py
 Restart=on-failure
-RestartSec=5
 
 [Install]
 WantedBy=multi-user.target
 ```
 
 ```bash
-systemctl enable obsidian-sync
-systemctl start obsidian-sync
-journalctl -u obsidian-sync -f   # 로그 확인
+systemctl enable obsidian-sync && systemctl start obsidian-sync
 ```
-
----
-
-## 새 기기에서 설정
-
-```bash
-git clone <repo-url>
-cd obsidian_sync
-uv sync
-cp config.example.yaml config.yaml
-# config.yaml 편집 (볼트 경로, folder_id)
-# credentials.json 복사 (Google Cloud Console에서 재발급 가능)
-uv run python main.py   # 첫 실행: 브라우저 OAuth 인증
-```
-
-> `token.json`, `config.yaml`, `credentials.json`은 `.gitignore`에 포함되어 있으므로 기기마다 별도 생성해야 합니다.
 
 ---
 
 ## 로그 확인
 
 ```bash
-tail -f obsidian_sync.log
+tail -f obsidian_sync.log          # Linux/macOS
+type obsidian_sync.log             # Windows
 ```
 
 로그 파일은 5MB마다 교체되며 최대 3개 보관됩니다.
+
+---
+
+## 테스트
+
+```bash
+uv run python -m pytest tests/ -v
+```
+
+개발용 의존성이 필요합니다:
+
+```bash
+uv sync --extra dev
+```
 
 ---
 
@@ -209,13 +209,35 @@ tail -f obsidian_sync.log
 
 ```
 obsidian_sync/
-├── core/
-│   ├── watcher.py       # watchdog 감지 + 디바운스
-│   └── drive_sync.py    # Google Drive API 래퍼 + 폴링
-├── hooks/
-│   ├── __init__.py      # 훅 레지스트리
-│   └── sync_hook.py     # ChangeEvent, BaseHook, SyncHook
-├── main.py              # 데몬 진입점
-├── config.example.yaml  # 설정 템플릿
+├── src/                          # 신규 모듈 (스펙 기반 리팩토링)
+│   ├── config.py                 #   설정 로드, 제외 패턴, 폴링 상수
+│   ├── state.py                  #   sync_state.json 관리 (load/save/scan/diff)
+│   └── drive_client.py           #   Google Drive API 래퍼 (순수 API 호출)
+├── core/                         # 현재 운영 중인 모듈
+│   ├── watcher.py                #   watchdog 감지 + 디바운스
+│   └── drive_sync.py             #   Drive API + 폴링 + 동기화 로직
+├── hooks/                        # 훅 시스템
+│   ├── __init__.py               #   훅 레지스트리
+│   └── sync_hook.py              #   파일 변경 → Drive 동기화 훅
+├── tests/                        # 단위 테스트 (80개)
+│   ├── test_config.py
+│   ├── test_state.py
+│   └── test_drive_client.py
+├── main.py                       # 데몬 진입점
+├── config.example.yaml           # 설정 템플릿
+├── SETUP_GUIDE.md                # 새 기기 설정 상세 가이드
 └── README.md
 ```
+
+### 동기화에서 제외되는 파일
+
+| 패턴 | 이유 |
+|------|------|
+| `.obsidian/` | Obsidian 내부 설정 (열 때마다 바뀌어서 충돌 폭탄) |
+| `.sync/` | 이 프로그램의 상태 파일 |
+| `.trash/` | Obsidian 휴지통 |
+| `.smart-env/` | Smart Environment 플러그인 캐시 |
+| `.DS_Store` | macOS 시스템 파일 |
+| `*.tmp` | 임시 파일 |
+
+> `.obsidian/` 제외는 1차 구현 결정이며, 향후 `.obsidian/plugins/` 등 선택적 동기화 옵션을 추가할 예정입니다.

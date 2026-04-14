@@ -31,6 +31,9 @@ class DebouncedHandler(FileSystemEventHandler):
       downloaded files to disk.
     """
 
+    # 동기화 제외 폴더 (옵시디언 내부 + 플러그인 자동 생성 파일 — API 호출 폭주 방지)
+    IGNORE_DIRS = {".obsidian", ".smart-env", ".trash"}
+
     def __init__(
         self,
         hooks: list[BaseHook],
@@ -41,12 +44,15 @@ class DebouncedHandler(FileSystemEventHandler):
         super().__init__()
         self._hooks = hooks
         self._debounce_seconds = debounce_seconds
-        self._ignore_paths = ignore_paths   # shared reference with DriveSync
-        self._ignore_lock = ignore_lock     # shared reference with DriveSync
+        self._ignore_paths = ignore_paths   # DriveSync와 공유 (순환 방지용)
+        self._ignore_lock = ignore_lock
         self._timers: dict[str, threading.Timer] = {}
         self._timers_lock = threading.Lock()
 
     def _is_ignored(self, path: str) -> bool:
+        parts = path.replace("\\", "/").split("/")
+        if any(p in self.IGNORE_DIRS for p in parts):
+            return True
         with self._ignore_lock:
             return path in self._ignore_paths
 
