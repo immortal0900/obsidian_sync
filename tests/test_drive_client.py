@@ -7,9 +7,15 @@ from __future__ import annotations
 from unittest.mock import MagicMock, patch
 
 import pytest
+from googleapiclient.errors import HttpError
 
 from src.config import SyncConfig
-from src.drive_client import MIME_FOLDER, DriveClient
+from src.drive_client import (
+    MIME_FOLDER,
+    DriveClient,
+    TokenInvalidError,
+    _execute_with_retry,
+)
 
 
 @pytest.fixture
@@ -599,3 +605,221 @@ class TestGetInitialToken:
 
         token = drive_client.get_initial_token()
         assert token == "initial_token_789"
+
+
+def _make_http_error(status: int, reason: str = "") -> HttpError:
+    """googleapiclient HttpError를 간편 생성한다."""
+    resp = MagicMock()
+    resp.status = status
+    resp.reason = reason or "test"
+    return HttpError(resp, b'{"error":{"message":"mock"}}')
+
+
+class TestExecuteWithRetry:
+    """_execute_with_retry 정책 검증."""
+
+    def test_success_no_retry(self):
+        """성공 응답이면 재시도하지 않는다."""
+        request = MagicMock()
+        request.execute.return_value = {"ok": True}
+
+        with patch("src.drive_client.time.sleep") as mock_sleep:
+            result = _execute_with_retry(request)
+
+        assert result == {"ok": True}
+        assert request.execute.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_429_exponential_backoff(self):
+        """429 응답 mock 시 지수백오프 대기시간이 1→2→4…로 증가."""
+        err_429 = _make_http_error(429, "Too Many Requests")
+
+        request = MagicMock()
+        # 3번 429, 4번째 성공
+        request.execute.side_effect = [
+            err_429, err_429, err_429,
+            {"ok": True},
+        ]
+
+        with patch("src.drive_client.time.sleep") as mock_sleep:
+            result = _execute_with_retry(request)
+
+        assert result == {"ok": True}
+        # 지수 증가 확인: 1 → 2 → 4
+        waits = [call.args[0] for call in mock_sleep.call_args_list]
+        assert waits == [1.0, 2.0, 4.0]
+
+    def test_429_cap_at_max_delay(self):
+        """429가 반복되면 RATE_LIMIT_MAX_DELAY(300s)를 넘지 않는다."""
+        from src.drive_client import RATE_LIMIT_MAX_DELAY
+
+        err_429 = _make_http_error(429)
+        request = MagicMock()
+        # 10번 429 + 성공
+        request.execute.side_effect = [err_429] * 10 + [{"ok": True}]
+
+        with patch("src.drive_client.time.sleep") as mock_sleep:
+            result = _execute_with_retry(request)
+
+        assert result == {"ok": True}
+        waits = [call.args[0] for call in mock_sleep.call_args_list]
+        assert all(w <= RATE_LIMIT_MAX_DELAY for w in waits)
+        # 끝부분은 cap에 도달
+        assert waits[-1] == RATE_LIMIT_MAX_DELAY
+
+    def test_410_raises_token_invalid(self):
+        """410 Gone 수신 시 TokenInvalidError로 변환된다."""
+        err_410 = _make_http_error(410, "Gone")
+        request = MagicMock()
+        request.execute.side_effect = err_410
+
+        with patch("src.drive_client.time.sleep"):
+            with pytest.raises(TokenInvalidError):
+                _execute_with_retry(request)
+
+    def test_401_raises_immediately(self):
+        """401 Unauthorized는 재시도 없이 즉시 전파."""
+        err_401 = _make_http_error(401, "Unauthorized")
+        request = MagicMock()
+        request.execute.side_effect = err_401
+
+        with patch("src.drive_client.time.sleep") as mock_sleep:
+            with pytest.raises(HttpError):
+                _execute_with_retry(request)
+
+        assert request.execute.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_403_raises_immediately(self):
+        """403 Forbidden도 즉시 전파."""
+        err_403 = _make_http_error(403, "Forbidden")
+        request = MagicMock()
+        request.execute.side_effect = err_403
+
+        with patch("src.drive_client.time.sleep") as mock_sleep:
+            with pytest.raises(HttpError):
+                _execute_with_retry(request)
+
+        assert request.execute.call_count == 1
+        mock_sleep.assert_not_called()
+
+    def test_5xx_retries_then_raises(self):
+        """5xx는 최대 3회 재시도 후 전파."""
+        err_503 = _make_http_error(503, "Service Unavailable")
+        request = MagicMock()
+        request.execute.side_effect = err_503  # 무한 503
+
+        with patch("src.drive_client.time.sleep") as mock_sleep:
+            with pytest.raises(HttpError):
+                _execute_with_retry(request)
+
+        # 최초 1회 + 3회 재시도 = 4회 호출
+        assert request.execute.call_count == 4
+        waits = [call.args[0] for call in mock_sleep.call_args_list]
+        assert waits == [1.0, 2.0, 4.0]
+
+    def test_network_error_retries(self):
+        """네트워크 오류도 3회 재시도 (1→2→4s)."""
+        request = MagicMock()
+        request.execute.side_effect = [
+            OSError("connection reset"),
+            OSError("timeout"),
+            {"ok": True},
+        ]
+
+        with patch("src.drive_client.time.sleep") as mock_sleep:
+            result = _execute_with_retry(request)
+
+        assert result == {"ok": True}
+        waits = [call.args[0] for call in mock_sleep.call_args_list]
+        assert waits == [1.0, 2.0]
+
+
+class TestGetChangesErrorHandling:
+    """get_changes의 오류 처리 경로 검증."""
+
+    def test_get_changes_410_propagates_token_invalid(self, drive_client):
+        """get_changes가 410 Gone을 받으면 TokenInvalidError를 던져
+        상위에서 토큰 재발급 + run_without_state 경로를 유도하게 한다."""
+        err_410 = _make_http_error(410, "Gone")
+        drive_client._service.changes().list.return_value.execute.side_effect = err_410
+
+        with patch("src.drive_client.time.sleep"):
+            with pytest.raises(TokenInvalidError):
+                drive_client.get_changes("stale_token")
+
+    def test_get_changes_429_backoff_then_success(self, drive_client):
+        """get_changes 429 → 재시도 → 성공."""
+        err_429 = _make_http_error(429)
+        success = {
+            "newStartPageToken": "new_token",
+            "changes": [],
+        }
+        drive_client._service.changes().list.return_value.execute.side_effect = [
+            err_429, err_429, success,
+        ]
+
+        with patch("src.drive_client.time.sleep") as mock_sleep:
+            changes, new_token = drive_client.get_changes("old_token")
+
+        assert new_token == "new_token"
+        assert changes == []
+        waits = [call.args[0] for call in mock_sleep.call_args_list]
+        assert waits == [1.0, 2.0]
+
+
+class TestGetChangesSchemaNormalization:
+    """get_changes 반환 스키마 정규화 검증."""
+
+    def test_file_payload_has_name_modified_time_md5(self, drive_client):
+        """반환된 file에 name, modified_time, md5만 포함되도록 정규화."""
+        drive_client._service.changes().list.return_value.execute.return_value = {
+            "newStartPageToken": "tok",
+            "changes": [
+                {
+                    "fileId": "f1",
+                    "removed": False,
+                    "file": {
+                        "id": "f1",
+                        "name": "note.md",
+                        "mimeType": "text/plain",
+                        "modifiedTime": "2026-04-14T10:00:00Z",
+                        "parents": ["root_folder_id"],
+                        "trashed": False,
+                        "size": "100",
+                        "md5Checksum": "abc123",
+                    },
+                },
+            ],
+        }
+
+        changes, _ = drive_client.get_changes("t")
+        payload = changes[0]["file"]
+        assert payload is not None
+        assert payload["name"] == "note.md"
+        assert payload["modified_time"] == "2026-04-14T10:00:00Z"
+        assert payload["md5"] == "abc123"
+        assert set(payload.keys()) == {"name", "modified_time", "md5"}
+
+    def test_google_doc_without_md5(self, drive_client):
+        """md5Checksum이 없는 Google Doc은 md5=None으로 정규화."""
+        drive_client._service.changes().list.return_value.execute.return_value = {
+            "newStartPageToken": "tok",
+            "changes": [
+                {
+                    "fileId": "gdoc1",
+                    "removed": False,
+                    "file": {
+                        "id": "gdoc1",
+                        "name": "문서",
+                        "mimeType": "application/vnd.google-apps.document",
+                        "modifiedTime": "2026-04-14T10:00:00Z",
+                        "parents": ["root_folder_id"],
+                        "trashed": False,
+                    },
+                },
+            ],
+        }
+
+        changes, _ = drive_client.get_changes("t")
+        assert changes[0]["file"]["md5"] is None

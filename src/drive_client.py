@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any
@@ -15,6 +16,7 @@ import googleapiclient.http
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
+from googleapiclient.errors import HttpError
 
 from src.config import SyncConfig
 
@@ -22,6 +24,92 @@ logger = logging.getLogger(__name__)
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
 MIME_FOLDER = "application/vnd.google-apps.folder"
+
+# ── 오류 처리 정책 상수 ────────────────────────────────────────────────────
+RETRY_MAX_ATTEMPTS = 3          # 네트워크/5xx 재시도 횟수
+RETRY_BASE_DELAY = 1.0          # 재시도 기본 간격 (지수: 1→2→4s)
+RATE_LIMIT_MAX_DELAY = 300.0    # 429 최대 대기시간 (5분)
+RATE_LIMIT_MAX_ATTEMPTS = 10    # 429 무한 루프 방지
+
+
+class TokenInvalidError(Exception):
+    """Drive Changes API page_token이 무효화됨 (410 Gone). 재발급 필요."""
+
+
+def _http_status(error: HttpError) -> int | None:
+    """HttpError에서 정수 status 코드를 추출한다."""
+    raw = getattr(error.resp, "status", None)
+    if raw is None:
+        return None
+    if isinstance(raw, int):
+        return raw
+    try:
+        return int(raw)
+    except (TypeError, ValueError):
+        return None
+
+
+def _execute_with_retry(request: Any, *, description: str = "drive_api") -> Any:
+    """Drive API 요청을 재시도 정책과 함께 실행한다.
+
+    정책:
+    - 429 Too Many Requests: 지수 백오프 1→2→4→…→300s, 최대 10회.
+    - 5xx 서버 오류: 최대 3회 재시도 (1→2→4s).
+    - 네트워크/IO 오류: 최대 3회 재시도 (1→2→4s).
+    - 401/403: 즉시 전파 (자격증명 문제).
+    - 410 Gone: TokenInvalidError로 변환.
+    - 기타 4xx: 즉시 전파.
+    """
+    attempt = 0
+    rate_attempt = 0
+    rate_delay = RETRY_BASE_DELAY
+
+    while True:
+        try:
+            return request.execute()
+        except HttpError as e:
+            status = _http_status(e)
+
+            if status in (401, 403):
+                logger.error(f"{description} 자격증명 문제: HTTP {status}")
+                raise
+
+            if status == 410:
+                logger.warning(f"{description} page_token 무효(410 Gone) — 재발급 필요")
+                raise TokenInvalidError(str(e)) from e
+
+            if status == 429:
+                if rate_attempt >= RATE_LIMIT_MAX_ATTEMPTS:
+                    logger.error(f"{description} 429 재시도 한계 초과")
+                    raise
+                wait = min(rate_delay, RATE_LIMIT_MAX_DELAY)
+                logger.warning(f"{description} 429 Too Many Requests — {wait}s 대기")
+                time.sleep(wait)
+                rate_delay = min(rate_delay * 2, RATE_LIMIT_MAX_DELAY)
+                rate_attempt += 1
+                continue
+
+            if status is not None and 500 <= status < 600:
+                if attempt >= RETRY_MAX_ATTEMPTS:
+                    logger.error(f"{description} {status} 재시도 한계 초과")
+                    raise
+                wait = RETRY_BASE_DELAY * (2 ** attempt)
+                logger.warning(f"{description} HTTP {status} — {wait}s 후 재시도")
+                time.sleep(wait)
+                attempt += 1
+                continue
+
+            # 기타 4xx: 재시도하지 않음
+            raise
+
+        except (OSError, TimeoutError) as e:
+            if attempt >= RETRY_MAX_ATTEMPTS:
+                logger.error(f"{description} 네트워크 재시도 한계 초과: {e}")
+                raise
+            wait = RETRY_BASE_DELAY * (2 ** attempt)
+            logger.warning(f"{description} 네트워크 오류 — {wait}s 후 재시도: {e}")
+            time.sleep(wait)
+            attempt += 1
 
 
 class DriveClient:
@@ -267,7 +355,8 @@ class DriveClient:
 
     def get_initial_token(self) -> str:
         """현재 시점의 Changes API 시작 토큰을 발급받는다."""
-        result = self._service.changes().getStartPageToken().execute()
+        request = self._service.changes().getStartPageToken()
+        result = _execute_with_retry(request, description="get_initial_token")
         token = result["startPageToken"]
         logger.info(f"Changes API 시작 토큰: {token}")
         return token
@@ -294,21 +383,19 @@ class DriveClient:
         new_token = page_token
 
         while current_token:
-            resp = (
-                self._service.changes()
-                .list(
-                    pageToken=current_token,
-                    spaces="drive",
-                    fields=(
-                        "nextPageToken,newStartPageToken,"
-                        "changes(fileId,removed,"
-                        "file(id,name,mimeType,modifiedTime,parents,trashed,size))"
-                    ),
-                    includeRemoved=True,
-                    pageSize=100,
-                )
-                .execute()
+            request = self._service.changes().list(
+                pageToken=current_token,
+                spaces="drive",
+                fields=(
+                    "nextPageToken,newStartPageToken,"
+                    "changes(fileId,removed,"
+                    "file(id,name,mimeType,modifiedTime,parents,trashed,"
+                    "size,md5Checksum))"
+                ),
+                includeRemoved=True,
+                pageSize=100,
             )
+            resp = _execute_with_retry(request, description="get_changes")
 
             for change in resp.get("changes", []):
                 normalized = self._normalize_change(change)
@@ -366,10 +453,22 @@ class DriveClient:
         # 삭제 판정: removed=True OR trashed=True
         is_deleted = removed or is_trashed
 
+        # 소비자(sync engine) 용 정규화된 스키마
+        # Google Docs(.gdoc 등)는 md5Checksum이 없어 None이 될 수 있다.
+        file_payload: dict | None
+        if is_deleted:
+            file_payload = None
+        else:
+            file_payload = {
+                "name": file_meta.get("name"),
+                "modified_time": file_meta.get("modifiedTime"),
+                "md5": file_meta.get("md5Checksum"),
+            }
+
         return {
             "file_id": file_id,
             "removed": is_deleted,
-            "file": file_meta if not is_deleted else None,
+            "file": file_payload,
         }
 
     def _is_in_vault(self, file_id: str, parents: list[str]) -> bool:
