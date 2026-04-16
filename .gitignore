@@ -12,6 +12,7 @@ wheels/
 # Machine-specific config and secrets
 config.yaml
 credentials.json
+credentials/
 token.json
 
 # Runtime files
@@ -25,3 +26,21 @@ nssm.exe
 .claude/
 .obsidian/
 지침1.md
+# forge runtime
+.env
+artifacts/spec.md
+artifacts/plan-review.md
+artifacts/sprint-contract.md
+artifacts/progress-log.md
+artifacts/qa-report.md
+artifacts/harness-cost-log.txt
+artifacts/.harness-checkpoint
+artifacts/.backup/
+artifacts/specs/
+artifacts/decisions/
+artifacts/.approval-signal
+artifacts/.skip-signal
+artifacts/.continue-signal
+artifacts/.exit-signal
+artifacts/.eval-signal
+artifacts/.stop-signal

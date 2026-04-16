@@ -14,4 +14,39 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5.0",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "F",   # pyflakes
+    "I",   # isort
+    "UP",  # pyupgrade (f-string 권장)
+    "ANN", # flake8-annotations (타입힌트 강제)
+    "B",   # flake8-bugbear
+]
+ignore = [
+    "ANN401",  # Any 허용
+    "E501",   # 라인 길이는 formatter가 처리
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["ANN", "B"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
+[tool.forge]
+max_sprint_minutes = 180
+max_generator_minutes = 120
+planner_max_turns = 15
+planner_review_max_turns = 10
+contract_max_turns = 12
+evaluator_max_turns = 20

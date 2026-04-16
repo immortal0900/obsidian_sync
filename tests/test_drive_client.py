@@ -4,13 +4,12 @@ Google Drive API 호출은 mock 처리한다.
 """
 from __future__ import annotations
 
-from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
 
 from src.config import SyncConfig
-from src.drive_client import DriveClient, MIME_FOLDER
+from src.drive_client import MIME_FOLDER, DriveClient
 
 
 @pytest.fixture
