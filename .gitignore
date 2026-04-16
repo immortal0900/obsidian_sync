@@ -21,6 +21,8 @@ daemon.lock
 *.log
 *.log.*
 nssm.exe
+.coverage
+htmlcov/
 
 # IDE / tool settings
 .claude/
