@@ -26,12 +26,15 @@ STATE_FILE_NAME: str = "sync_state.json"
 # 향후: .obsidian/plugins/*/data.json 등 선택적 동기화 옵션 추가 예정
 
 IGNORE_PATTERNS: list[str] = [
-    ".obsidian/",
-    ".sync/",
-    ".trash/",
-    ".smart-env/",
-    ".DS_Store",
-    "*.tmp",
+    ".obsidian/",          # Obsidian 설정 전체 (workspace.json 포함)
+    ".sync/",              # 이 프로그램의 상태 파일
+    ".trash/",             # Obsidian 휴지통
+    ".smart-env/",         # Smart Connections 플러그인
+    ".git/",               # Git 메타데이터
+    ".DS_Store",           # macOS Finder
+    "Thumbs.db",           # Windows Explorer
+    "*.tmp",               # 임시 파일
+    "*.swp",               # Vim swap
 ]
 
 # ── 적응형 폴링 상수 ─────────────────────────────────────────────────────

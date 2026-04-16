@@ -4,7 +4,7 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from src.config import SyncConfig, should_ignore
+from src.config import IGNORE_PATTERNS, SyncConfig, should_ignore
 
 
 @pytest.fixture
@@ -204,3 +204,28 @@ class TestShouldIgnore:
         """Windows 경로(백슬래시)도 올바르게 처리한다."""
         assert should_ignore(".obsidian\\workspace.json") is True
         assert should_ignore("notes\\hello.md") is False
+
+    def test_git_directory(self):
+        assert should_ignore(".git/HEAD") is True
+
+    def test_thumbs_db(self):
+        assert should_ignore("Thumbs.db") is True
+
+    def test_swp_files(self):
+        assert should_ignore("note.md.swp") is True
+
+
+class TestIgnorePatterns:
+    """IGNORE_PATTERNS 상수 테스트."""
+
+    def test_has_at_least_8_patterns(self):
+        """sprint contract: IGNORE_PATTERNS가 8개 이상 포함."""
+        assert len(IGNORE_PATTERNS) >= 8
+
+    def test_covers_required_patterns(self):
+        """spec §7의 필수 제외 패턴이 모두 포함되어 있다."""
+        # 디렉토리 umbrella 또는 구체 경로로 커버되어야 함
+        required = [".obsidian", ".sync", ".trash", ".DS_Store", "*.tmp"]
+        as_text = "|".join(IGNORE_PATTERNS)
+        for pattern in required:
+            assert pattern in as_text, f"누락: {pattern}"
