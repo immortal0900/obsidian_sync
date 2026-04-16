@@ -128,6 +128,27 @@ class TestSyncStateLoad:
         assert backup_path.exists()
         assert not sync_state._state_file.exists()
 
+    def test_load_version_mismatch_returns_false(self, sync_state):
+        """version 불일치 시 False 반환 + 백업 생성 → run_without_state 경로 유도."""
+        state_dir = sync_state._state_dir
+        state_dir.mkdir(parents=True)
+
+        future_state = {
+            "version": 2,
+            "device_id": "my_pc",
+            "page_token": "x",
+            "last_synced_at": 0,
+            "files": {},
+        }
+        sync_state._state_file.write_text(
+            json.dumps(future_state), encoding="utf-8"
+        )
+
+        assert sync_state.load() is False
+        backup_path = sync_state._state_file.with_suffix(".json.backup")
+        assert backup_path.exists()
+        assert not sync_state._state_file.exists()
+
 
 class TestSyncStateSave:
     """SyncState.save 테스트."""
@@ -318,6 +339,81 @@ class TestSyncStateUpdateRemove:
         # 타이머 정리
         if sync_state._save_timer:
             sync_state._save_timer.cancel()
+
+
+class TestSyncStateAtomicWrite:
+    """save() atomic write 검증."""
+
+    def test_existing_file_preserved_on_write_failure(self, sync_state):
+        """_write_state_file 중간 예외 발생 시 기존 파일이 온전히 보존된다."""
+        from unittest.mock import patch
+
+        # 1회차 저장으로 온전한 상태 파일 생성
+        sync_state.files["keep.md"] = FileEntry(mtime=111.0, size=11, drive_id="id1")
+        sync_state.save(immediate=True)
+        original_bytes = sync_state._state_file.read_bytes()
+
+        # 2회차: os.replace 실패 모의 → 기존 파일 그대로 유지 + tmp 정리
+        sync_state.files["keep.md"] = FileEntry(mtime=222.0, size=22, drive_id="id2")
+        with patch(
+            "src.state.os.replace", side_effect=OSError("simulated disk failure")
+        ):
+            sync_state.save(immediate=True)  # 내부에서 실패 로깅
+
+        # 기존 파일이 그대로 남아있어야 한다
+        assert sync_state._state_file.read_bytes() == original_bytes
+
+        # tmp 파일이 남지 않았는지 확인
+        leftover = list(sync_state._state_dir.glob("*.tmp"))
+        assert leftover == []
+
+
+class TestSyncStateSize:
+    """대용량 상태 파일 크기 검증."""
+
+    def test_1000_files_size_under_150kb(self, sync_state):
+        """1,000개 파일 상태 파일 크기가 150KB 이하."""
+        for i in range(1000):
+            path = f"notes/section_{i // 50}/file_{i:04d}.md"
+            sync_state.files[path] = FileEntry(
+                mtime=1713000000.0 + i,
+                size=2048 + i,
+                drive_id=f"drive_id_{i:020d}",
+            )
+        sync_state.page_token = "999999"
+        sync_state.save(immediate=True)
+
+        size_bytes = sync_state._state_file.stat().st_size
+        assert size_bytes <= 150 * 1024, f"크기 초과: {size_bytes} bytes"
+
+
+class TestSyncStatePathNormalization:
+    """Windows 경로 POSIX 정규화 검증."""
+
+    def test_scan_normalizes_backslash_to_forward_slash(self, mock_config):
+        """scan_local_files 결과 key는 항상 POSIX 구분자를 사용한다."""
+        vault = mock_config.vault_path
+        (vault / "daily").mkdir()
+        (vault / "daily" / "2026-04-14.md").write_text("x", encoding="utf-8")
+
+        state = SyncState(mock_config)
+        files = state.scan_local_files()
+
+        # 결과 key는 항상 "/" 사용
+        assert "daily/2026-04-14.md" in files
+        for key in files:
+            assert "\\" not in key
+
+    def test_saved_state_has_posix_keys(self, mock_config):
+        """save() 결과 JSON의 files 키도 POSIX 구분자를 유지한다."""
+        state = SyncState(mock_config)
+        state.files["sub/dir/note.md"] = FileEntry(mtime=1.0, size=1)
+        state.save(immediate=True)
+
+        raw = state._state_file.read_text(encoding="utf-8")
+        data = json.loads(raw)
+        for key in data["files"]:
+            assert "\\" not in key
 
 
 class TestSyncStateShutdown:

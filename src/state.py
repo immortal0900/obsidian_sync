@@ -105,12 +105,17 @@ class SyncState:
             data = json.loads(raw_text)
         except (json.JSONDecodeError, UnicodeDecodeError) as e:
             logger.warning(f"상태 파일 파싱 실패: {e}")
-            backup_path = self._state_file.with_suffix(".json.backup")
-            try:
-                self._state_file.rename(backup_path)
-                logger.info(f"손상된 상태 파일을 백업했습니다: {backup_path}")
-            except OSError:
-                logger.exception("상태 파일 백업 실패")
+            self._backup_corrupt_state()
+            return False
+
+        # 스키마 버전 검증 — 불일치 시 run_without_state 경로 유도
+        file_version = data.get("version")
+        if file_version != self.VERSION:
+            logger.warning(
+                f"상태 파일 version 불일치: file={file_version}, "
+                f"expected={self.VERSION} → 전체 재동기화 모드로 전환"
+            )
+            self._backup_corrupt_state()
             return False
 
         # 인메모리 상태 채우기
@@ -127,6 +132,15 @@ class SyncState:
             f"page_token={self.page_token}"
         )
         return True
+
+    def _backup_corrupt_state(self) -> None:
+        """손상/버전 불일치 상태 파일을 .backup으로 이동한다."""
+        backup_path = self._state_file.with_suffix(".json.backup")
+        try:
+            self._state_file.rename(backup_path)
+            logger.info(f"상태 파일을 백업했습니다: {backup_path}")
+        except OSError:
+            logger.exception("상태 파일 백업 실패")
 
     def save(self, immediate: bool = False) -> None:
         """현재 상태를 sync_state.json에 저장한다.
