@@ -84,6 +84,71 @@ def setup_logging(config: SyncConfig) -> None:
     root._obsidian_sync_configured = True  # type: ignore[attr-defined]
 
 
+# ── 토큰 재발급 (P0-2) ───────────────────────────────────────────────────
+
+
+class TokenRefreshCoordinator:
+    """poller의 `TokenInvalidError` 콜백.
+
+    - `asyncio.Lock`으로 중복 재진입 방지.
+    - `reconciler.run_without_state()` 실행 후 `state.save(immediate=True)`.
+    - 자격증명 실패(FileNotFoundError/PermissionError) 시 `shutdown_event` 세팅.
+    """
+
+    def __init__(
+        self,
+        drive: DriveClient,
+        reconciler: Reconciler,
+        engine: SyncEngine,
+        state: SyncState,
+        shutdown_event: asyncio.Event,
+    ) -> None:
+        self._drive = drive
+        self._reconciler = reconciler
+        self._engine = engine
+        self._state = state
+        self._shutdown_event = shutdown_event
+        self._lock = asyncio.Lock()
+
+    @property
+    def locked(self) -> bool:
+        """재진입 중 여부 (테스트용)."""
+        return self._lock.locked()
+
+    async def __call__(self) -> None:
+        """토큰 재발급 + 전체 재대조."""
+        if self._lock.locked():
+            logger.info("TokenRefresh: 이미 진행 중 — 중복 재진입 차단")
+            return
+        async with self._lock:
+            logger.warning("TokenRefresh: run_without_state 재진입 시작")
+            loop = asyncio.get_running_loop()
+            try:
+                actions = await loop.run_in_executor(
+                    None, self._reconciler.run_without_state
+                )
+            except (FileNotFoundError, PermissionError):
+                logger.exception("TokenRefresh: 자격증명 문제 → 종료 신호")
+                self._shutdown_event.set()
+                return
+            except Exception:
+                logger.exception("TokenRefresh: 예기치 못한 실패 → 종료 신호")
+                self._shutdown_event.set()
+                return
+
+            for action in actions:
+                try:
+                    await loop.run_in_executor(None, self._engine.execute, action)
+                except Exception:
+                    logger.exception(f"TokenRefresh: action 실행 실패: {action}")
+
+            try:
+                self._state.save(immediate=True)
+            except Exception:
+                logger.exception("TokenRefresh: state.save 실패")
+            logger.info("TokenRefresh: 재진입 완료")
+
+
 # ── 초기 대조 ────────────────────────────────────────────────────────────
 
 
@@ -308,7 +373,32 @@ async def main(config_path: str | Path = "config.yaml") -> int:
     setup_logging(config)
 
     shutdown_event = asyncio.Event()
-    ctx = build_context(config, shutdown_event, on_token_invalid=None)
+    # token_refresh는 reconciler/engine/state를 먼저 조립한 뒤 구성된다.
+    stub_ctx = build_context(config, shutdown_event, on_token_invalid=None)
+    token_refresh = TokenRefreshCoordinator(
+        stub_ctx.drive,
+        stub_ctx.reconciler,
+        stub_ctx.engine,
+        stub_ctx.state,
+        shutdown_event,
+    )
+    # poller에 콜백을 주입하여 최종 컨텍스트 조립
+    ctx = AppContext(
+        config=stub_ctx.config,
+        drive=stub_ctx.drive,
+        state=stub_ctx.state,
+        engine=stub_ctx.engine,
+        reconciler=stub_ctx.reconciler,
+        watcher=stub_ctx.watcher,
+        poller=AdaptivePoller(
+            stub_ctx.drive,
+            stub_ctx.engine,
+            stub_ctx.watcher,
+            stub_ctx.state,
+            on_token_invalid=token_refresh,
+        ),
+        shutdown_event=shutdown_event,
+    )
     return await run_app(ctx)
 
 

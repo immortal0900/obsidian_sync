@@ -20,6 +20,7 @@ import pytest
 from src.config import SyncConfig
 from src.main import (
     AppContext,
+    TokenRefreshCoordinator,
     build_context,
     initial_reconcile,
     install_signal_handlers,
@@ -239,6 +240,155 @@ class TestSignalHandlers:
     def test_sigint_constant_available(self) -> None:
         # 모든 플랫폼에서 SIGINT는 존재해야 함
         assert hasattr(signal, "SIGINT")
+
+
+# ── TokenRefreshCoordinator (P0-2) ──────────────────────────────────────
+
+
+class TestTokenRefreshCoordinator:
+    """TokenInvalidError 수신 시 run_without_state 재진입 플로우."""
+
+    @pytest.fixture
+    def shutdown_event(self) -> asyncio.Event:
+        return asyncio.Event()
+
+    async def test_invokes_run_without_state(
+        self, shutdown_event: asyncio.Event
+    ) -> None:
+        drive = MagicMock()
+        reconciler = MagicMock()
+        reconciler.run_without_state.return_value = [
+            {"type": "upload", "path": "a.md"}
+        ]
+        engine = MagicMock()
+        state = MagicMock()
+
+        coord = TokenRefreshCoordinator(
+            drive, reconciler, engine, state, shutdown_event
+        )
+        await coord()
+
+        reconciler.run_without_state.assert_called_once()
+        engine.execute.assert_called_once_with({"type": "upload", "path": "a.md"})
+        state.save.assert_called_once_with(immediate=True)
+        assert shutdown_event.is_set() is False
+
+    async def test_duplicate_reentry_blocked(
+        self, shutdown_event: asyncio.Event
+    ) -> None:
+        """중복 호출은 asyncio.Lock으로 차단되어 run_without_state가 1회만 실행된다."""
+        drive = MagicMock()
+        reconciler = MagicMock()
+
+        def _slow_run() -> list[dict]:
+            # run_in_executor에서 호출되는 동기 함수 — 짧게 blocking 대기
+            import time as _t
+
+            _t.sleep(0.05)
+            return []
+
+        reconciler.run_without_state.side_effect = _slow_run
+        engine = MagicMock()
+        state = MagicMock()
+
+        coord = TokenRefreshCoordinator(
+            drive, reconciler, engine, state, shutdown_event
+        )
+
+        first = asyncio.create_task(coord())
+        # 첫 호출이 락을 잡을 때까지 대기
+        for _ in range(20):
+            if coord.locked:
+                break
+            await asyncio.sleep(0.01)
+        # 두 번째 호출은 즉시 리턴되어야 함 (중복 차단)
+        await coord()
+        await first
+
+        assert reconciler.run_without_state.call_count == 1
+
+    async def test_filenotfound_sets_shutdown_event(
+        self, shutdown_event: asyncio.Event
+    ) -> None:
+        drive = MagicMock()
+        reconciler = MagicMock()
+        reconciler.run_without_state.side_effect = FileNotFoundError("no creds")
+        engine = MagicMock()
+        state = MagicMock()
+
+        coord = TokenRefreshCoordinator(
+            drive, reconciler, engine, state, shutdown_event
+        )
+        await coord()
+
+        assert shutdown_event.is_set()
+        engine.execute.assert_not_called()
+
+    async def test_unexpected_exception_sets_shutdown(
+        self, shutdown_event: asyncio.Event
+    ) -> None:
+        drive = MagicMock()
+        reconciler = MagicMock()
+        reconciler.run_without_state.side_effect = RuntimeError("boom")
+        engine = MagicMock()
+        state = MagicMock()
+
+        coord = TokenRefreshCoordinator(
+            drive, reconciler, engine, state, shutdown_event
+        )
+        await coord()
+
+        assert shutdown_event.is_set()
+
+    async def test_lock_released_after_completion(
+        self, shutdown_event: asyncio.Event
+    ) -> None:
+        drive = MagicMock()
+        reconciler = MagicMock()
+        reconciler.run_without_state.return_value = []
+        engine = MagicMock()
+        state = MagicMock()
+
+        coord = TokenRefreshCoordinator(
+            drive, reconciler, engine, state, shutdown_event
+        )
+        await coord()
+        assert coord.locked is False
+
+    async def test_integrated_with_poller(
+        self, shutdown_event: asyncio.Event
+    ) -> None:
+        """poller의 on_token_invalid로 등록되면 TokenInvalidError 수신 시 호출된다."""
+        from src.drive_client import TokenInvalidError
+        from src.poller import AdaptivePoller
+
+        reconciler = MagicMock()
+        reconciler.run_without_state.return_value = [
+            {"type": "download", "file_id": "fid1", "path": "a.md"}
+        ]
+        engine = MagicMock()
+        state = MagicMock()
+        state.page_token = "T0"
+
+        drive = MagicMock()
+        drive.get_changes.side_effect = TokenInvalidError("410")
+
+        watcher = MagicMock()
+        watcher.last_event_age.return_value = 9999.0
+
+        coord = TokenRefreshCoordinator(
+            drive, reconciler, engine, state, shutdown_event
+        )
+        poller = AdaptivePoller(
+            drive, engine, watcher, state, on_token_invalid=coord
+        )
+
+        await poller.poll_once()
+
+        # TokenInvalidError 수신 → coord가 호출되어 run_without_state 수행
+        reconciler.run_without_state.assert_called_once()
+        engine.execute.assert_called_once()
+        assert poller.token_invalid_signal is True
 
 
 # ── build_context ───────────────────────────────────────────────────────
