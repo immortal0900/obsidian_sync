@@ -90,6 +90,11 @@ class SyncState:
         self.last_synced_at: float | None = None
         self.files: dict[str, FileEntry] = {}
 
+    @property
+    def vault_path(self) -> Path:
+        """볼트 루트 절대 경로."""
+        return self._config.vault_path
+
     def load(self) -> bool:
         """sync_state.json을 읽어서 인메모리 상태를 채운다.
 
