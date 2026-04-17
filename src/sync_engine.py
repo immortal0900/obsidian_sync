@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any
 
 from src.conflict import ConflictResolver
-from src.drive_client import DriveClient, TokenInvalidError
+from src.drive_client import DriveClient, DriveFileNotFoundError, TokenInvalidError
 from src.state import FileEntry, SyncState
 
 logger = logging.getLogger(__name__)
@@ -147,8 +147,35 @@ class SyncEngine:
         except TokenInvalidError:
             # 토큰 무효화는 상위(reconciler)로 전파
             raise
+        except DriveFileNotFoundError as e:
+            # 404 — 상태 파일에서 해당 drive_id 제거
+            self._cleanup_missing_drive_id(e.file_id, action)
         except Exception:
             logger.exception(f"action 실행 실패: {action}")
+
+    def _cleanup_missing_drive_id(self, missing_id: str, action: dict) -> None:
+        """404로 사라진 drive_id를 state에서 정리한다."""
+        path_hint = action.get("path")
+        if path_hint is not None:
+            entry = self._state.files.get(path_hint)
+            if entry is not None and entry.drive_id == missing_id:
+                self._state.remove_file(path_hint)
+                logger.info(
+                    f"404 정리: state에서 제거 {path_hint} (drive_id={missing_id})"
+                )
+                return
+
+        # path 힌트로 찾지 못한 경우 drive_id 전체 스캔
+        to_remove: list[str] = [
+            path
+            for path, entry in self._state.files.items()
+            if entry.drive_id == missing_id
+        ]
+        for path in to_remove:
+            self._state.remove_file(path)
+            logger.info(
+                f"404 정리: state에서 제거 {path} (drive_id={missing_id})"
+            )
 
     def _do_upload(self, action: dict) -> None:
         path: str = action["path"]

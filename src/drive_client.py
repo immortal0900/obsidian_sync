@@ -36,6 +36,14 @@ class TokenInvalidError(Exception):
     """Drive Changes API page_token이 무효화됨 (410 Gone). 재발급 필요."""
 
 
+class DriveFileNotFoundError(Exception):
+    """Drive 파일이 404 Not Found — 상태 파일에서 해당 drive_id 제거 필요."""
+
+    def __init__(self, file_id: str, message: str | None = None) -> None:
+        self.file_id = file_id
+        super().__init__(message or f"Drive 파일을 찾을 수 없음: {file_id}")
+
+
 def _http_status(error: HttpError) -> int | None:
     """HttpError에서 정수 status 코드를 추출한다."""
     raw = getattr(error.resp, "status", None)
@@ -49,7 +57,12 @@ def _http_status(error: HttpError) -> int | None:
         return None
 
 
-def _execute_with_retry(request: Any, *, description: str = "drive_api") -> Any:
+def _execute_with_retry(
+    request: Any,
+    *,
+    description: str = "drive_api",
+    not_found_file_id: str | None = None,
+) -> Any:
     """Drive API 요청을 재시도 정책과 함께 실행한다.
 
     정책:
@@ -58,6 +71,7 @@ def _execute_with_retry(request: Any, *, description: str = "drive_api") -> Any:
     - 네트워크/IO 오류: 최대 3회 재시도 (1→2→4s).
     - 401/403: 즉시 전파 (자격증명 문제).
     - 410 Gone: TokenInvalidError로 변환.
+    - 404: `not_found_file_id`가 지정된 경우 `DriveFileNotFoundError`로 변환.
     - 기타 4xx: 즉시 전파.
     """
     attempt = 0
@@ -73,6 +87,12 @@ def _execute_with_retry(request: Any, *, description: str = "drive_api") -> Any:
             if status in (401, 403):
                 logger.error(f"{description} 자격증명 문제: HTTP {status}")
                 raise
+
+            if status == 404 and not_found_file_id is not None:
+                logger.warning(
+                    f"{description} 404 Not Found: {not_found_file_id}"
+                )
+                raise DriveFileNotFoundError(not_found_file_id, str(e)) from e
 
             if status == 410:
                 logger.warning(f"{description} page_token 무효(410 Gone) — 재발급 필요")
@@ -197,11 +217,16 @@ class DriveClient:
         )
 
         if existing_id:
-            self._service.files().update(
+            request = self._service.files().update(
                 fileId=existing_id,
                 body={"name": local_path.name},
                 media_body=media,
-            ).execute()
+            )
+            _execute_with_retry(
+                request,
+                description=f"upload.update[{relative_path}]",
+                not_found_file_id=existing_id,
+            )
             logger.info(f"Drive 업데이트: {relative_path}")
             return existing_id
         else:
@@ -210,10 +235,12 @@ class DriveClient:
             parent_id = self.ensure_folder_path(parent_rel)
 
             meta = {"name": local_path.name, "parents": [parent_id]}
-            result = (
+            request = (
                 self._service.files()
                 .create(body=meta, media_body=media, fields="id")
-                .execute()
+            )
+            result = _execute_with_retry(
+                request, description=f"upload.create[{relative_path}]"
             )
             file_id = result["id"]
             logger.info(f"Drive 업로드: {relative_path} (id={file_id})")
@@ -224,7 +251,11 @@ class DriveClient:
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
         request = self._service.files().get_media(fileId=drive_file_id)
-        content = request.execute()
+        content = _execute_with_retry(
+            request,
+            description=f"download[{drive_file_id}]",
+            not_found_file_id=drive_file_id,
+        )
         local_path.write_bytes(content)
         logger.info(f"Drive 다운로드: {local_path}")
 
@@ -234,16 +265,26 @@ class DriveClient:
         참고: trashed=True는 Changes API에서 removed=True가 아니라
         file.trashed=True로 감지된다. get_changes()에서 양쪽 모두 처리한다.
         """
-        self._service.files().update(
+        request = self._service.files().update(
             fileId=drive_file_id, body={"trashed": True}
-        ).execute()
+        )
+        _execute_with_retry(
+            request,
+            description=f"delete[{drive_file_id}]",
+            not_found_file_id=drive_file_id,
+        )
         logger.info(f"Drive 휴지통 이동: {drive_file_id}")
 
     def rename(self, drive_file_id: str, new_name: str) -> None:
         """Drive 파일의 이름을 변경한다."""
-        self._service.files().update(
+        request = self._service.files().update(
             fileId=drive_file_id, body={"name": new_name}
-        ).execute()
+        )
+        _execute_with_retry(
+            request,
+            description=f"rename[{drive_file_id}]",
+            not_found_file_id=drive_file_id,
+        )
         logger.info(f"Drive 이름 변경: {drive_file_id} → {new_name}")
 
     def move(
@@ -279,10 +320,11 @@ class DriveClient:
         fields: str = "id,name,modifiedTime,size,parents",
     ) -> dict:
         """Drive 파일의 메타데이터를 가져온다."""
-        return (
-            self._service.files()
-            .get(fileId=drive_file_id, fields=fields)
-            .execute()
+        request = self._service.files().get(fileId=drive_file_id, fields=fields)
+        return _execute_with_retry(
+            request,
+            description=f"get_file_metadata[{drive_file_id}]",
+            not_found_file_id=drive_file_id,
         )
 
     # ── 폴더 조작 ─────────────────────────────────────────────────────────
@@ -294,10 +336,12 @@ class DriveClient:
             f"name='{safe_name}' and '{parent_id}' in parents "
             f"and mimeType='{MIME_FOLDER}' and trashed=false"
         )
-        resp = (
+        request = (
             self._service.files()
             .list(q=q, fields="files(id)", pageSize=1)
-            .execute()
+        )
+        resp = _execute_with_retry(
+            request, description=f"find_folder[{name}]"
         )
         files = resp.get("files", [])
         return files[0]["id"] if files else None
@@ -309,10 +353,9 @@ class DriveClient:
             "mimeType": MIME_FOLDER,
             "parents": [parent_id],
         }
-        result = (
-            self._service.files()
-            .create(body=meta, fields="id")
-            .execute()
+        request = self._service.files().create(body=meta, fields="id")
+        result = _execute_with_retry(
+            request, description=f"create_folder[{name}]"
         )
         folder_id = result["id"]
         logger.info(f"Drive 폴더 생성: {name} (id={folder_id})")
@@ -569,7 +612,7 @@ class DriveClient:
 
             while True:
                 q = f"'{current_folder_id}' in parents and trashed=false"
-                resp = (
+                request = (
                     self._service.files()
                     .list(
                         q=q,
@@ -577,7 +620,9 @@ class DriveClient:
                         pageSize=100,
                         pageToken=page_token,
                     )
-                    .execute()
+                )
+                resp = _execute_with_retry(
+                    request, description=f"list_all_files[{current_folder_id}]"
                 )
 
                 for item in resp.get("files", []):

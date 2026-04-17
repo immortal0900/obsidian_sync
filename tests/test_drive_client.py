@@ -13,6 +13,7 @@ from src.config import SyncConfig
 from src.drive_client import (
     MIME_FOLDER,
     DriveClient,
+    DriveFileNotFoundError,
     TokenInvalidError,
     _execute_with_retry,
 )
@@ -823,3 +824,242 @@ class TestGetChangesSchemaNormalization:
 
         changes, _ = drive_client.get_changes("t")
         assert changes[0]["file"]["md5"] is None
+
+
+# ── Sprint 3: 파일 조작 retry / 404 정책 ────────────────────────────────
+
+
+class TestFileOpsRetry:
+    """모든 파일 조작 메서드에 retry 정책이 일괄 적용되는지 검증."""
+
+    def _set_execute_side_effect(
+        self, request_chain: MagicMock, side_effect: object
+    ) -> None:
+        """chained mock의 최종 `.execute()`에 side_effect를 주입한다."""
+        request_chain.execute.side_effect = side_effect
+
+    def test_upload_update_retries_5xx(self, drive_client, tmp_path):
+        """upload(update)가 5xx를 1→2→4s 간격으로 3회 재시도한다."""
+        local = tmp_path / "a.md"
+        local.write_text("x", encoding="utf-8")
+
+        err = _make_http_error(503)
+        req = drive_client._service.files().update.return_value
+        req.execute.side_effect = [err, err, err, err]
+
+        with patch("src.drive_client.time.sleep") as mock_sleep:
+            with pytest.raises(HttpError):
+                drive_client.upload(local, "a.md", existing_id="fid")
+
+        waits = [c.args[0] for c in mock_sleep.call_args_list]
+        assert waits == [1.0, 2.0, 4.0]
+        assert req.execute.call_count == 4
+
+    def test_upload_create_retries_5xx(self, drive_client, tmp_path):
+        """upload(create)가 5xx를 재시도한다."""
+        local = tmp_path / "b.md"
+        local.write_text("y", encoding="utf-8")
+
+        # ensure_folder_path는 건드리지 않도록 폴더 경로 없음
+        err = _make_http_error(503)
+        create_req = drive_client._service.files().create.return_value
+        create_req.execute.side_effect = [err, err, err, err]
+
+        with patch("src.drive_client.time.sleep"):
+            with pytest.raises(HttpError):
+                drive_client.upload(local, "b.md")
+
+        assert create_req.execute.call_count == 4
+
+    def test_download_retries_5xx(self, drive_client, tmp_path):
+        err = _make_http_error(503)
+        req = drive_client._service.files().get_media.return_value
+        req.execute.side_effect = [err, err, err, err]
+
+        with patch("src.drive_client.time.sleep") as mock_sleep:
+            with pytest.raises(HttpError):
+                drive_client.download("fid", tmp_path / "out.md")
+
+        waits = [c.args[0] for c in mock_sleep.call_args_list]
+        assert waits == [1.0, 2.0, 4.0]
+
+    def test_delete_retries_5xx(self, drive_client):
+        err = _make_http_error(503)
+        req = drive_client._service.files().update.return_value
+        req.execute.side_effect = [err, err, err, err]
+
+        with patch("src.drive_client.time.sleep") as mock_sleep:
+            with pytest.raises(HttpError):
+                drive_client.delete("fid")
+
+        waits = [c.args[0] for c in mock_sleep.call_args_list]
+        assert waits == [1.0, 2.0, 4.0]
+
+    def test_rename_retries_5xx(self, drive_client):
+        err = _make_http_error(503)
+        req = drive_client._service.files().update.return_value
+        req.execute.side_effect = [err, err, err, err]
+
+        with patch("src.drive_client.time.sleep") as mock_sleep:
+            with pytest.raises(HttpError):
+                drive_client.rename("fid", "new.md")
+
+        waits = [c.args[0] for c in mock_sleep.call_args_list]
+        assert waits == [1.0, 2.0, 4.0]
+
+    def test_find_folder_retries_5xx(self, drive_client):
+        err = _make_http_error(503)
+        success = {"files": [{"id": "folder_id"}]}
+        req = drive_client._service.files().list.return_value
+        req.execute.side_effect = [err, success]
+
+        with patch("src.drive_client.time.sleep"):
+            result = drive_client.find_folder("name", "parent")
+
+        assert result == "folder_id"
+        assert req.execute.call_count == 2
+
+    def test_create_folder_retries_5xx(self, drive_client):
+        err = _make_http_error(503)
+        success = {"id": "new_folder"}
+        req = drive_client._service.files().create.return_value
+        req.execute.side_effect = [err, success]
+
+        with patch("src.drive_client.time.sleep"):
+            result = drive_client.create_folder("sub", "parent")
+
+        assert result == "new_folder"
+
+    def test_list_all_files_retries_5xx(self, drive_client):
+        err = _make_http_error(503)
+        success = {
+            "files": [
+                {
+                    "id": "f1",
+                    "name": "note.md",
+                    "mimeType": "text/plain",
+                    "modifiedTime": "2026-04-14T10:00:00Z",
+                },
+            ],
+            "nextPageToken": None,
+        }
+        req = drive_client._service.files().list.return_value
+        req.execute.side_effect = [err, success]
+
+        with patch("src.drive_client.time.sleep"):
+            files = drive_client.list_all_files()
+
+        assert len(files) == 1
+        assert files[0]["relative_path"] == "note.md"
+
+    def test_get_file_metadata_retries_5xx(self, drive_client):
+        err = _make_http_error(503)
+        success = {"id": "fid", "name": "x.md"}
+        req = drive_client._service.files().get.return_value
+        req.execute.side_effect = [err, success]
+
+        with patch("src.drive_client.time.sleep"):
+            meta = drive_client.get_file_metadata("fid")
+
+        assert meta["id"] == "fid"
+
+
+class TestFileOps404Policy:
+    """파일 조작 404 → DriveFileNotFoundError 변환."""
+
+    def test_download_404_raises_not_found(self, drive_client, tmp_path):
+        err = _make_http_error(404, "Not Found")
+        req = drive_client._service.files().get_media.return_value
+        req.execute.side_effect = err
+
+        with patch("src.drive_client.time.sleep"):
+            with pytest.raises(DriveFileNotFoundError) as excinfo:
+                drive_client.download("missing", tmp_path / "x.md")
+
+        assert excinfo.value.file_id == "missing"
+
+    def test_delete_404_raises_not_found(self, drive_client):
+        err = _make_http_error(404)
+        req = drive_client._service.files().update.return_value
+        req.execute.side_effect = err
+
+        with patch("src.drive_client.time.sleep"):
+            with pytest.raises(DriveFileNotFoundError) as excinfo:
+                drive_client.delete("missing")
+
+        assert excinfo.value.file_id == "missing"
+
+    def test_rename_404_raises_not_found(self, drive_client):
+        err = _make_http_error(404)
+        req = drive_client._service.files().update.return_value
+        req.execute.side_effect = err
+
+        with patch("src.drive_client.time.sleep"):
+            with pytest.raises(DriveFileNotFoundError) as excinfo:
+                drive_client.rename("missing", "new.md")
+
+        assert excinfo.value.file_id == "missing"
+
+    def test_get_file_metadata_404_raises_not_found(self, drive_client):
+        err = _make_http_error(404)
+        req = drive_client._service.files().get.return_value
+        req.execute.side_effect = err
+
+        with patch("src.drive_client.time.sleep"):
+            with pytest.raises(DriveFileNotFoundError) as excinfo:
+                drive_client.get_file_metadata("missing")
+
+        assert excinfo.value.file_id == "missing"
+
+    def test_upload_update_404_raises_not_found(self, drive_client, tmp_path):
+        """existing_id로 update 중 404 발생 시 DriveFileNotFoundError."""
+        local = tmp_path / "a.md"
+        local.write_text("x", encoding="utf-8")
+
+        err = _make_http_error(404)
+        req = drive_client._service.files().update.return_value
+        req.execute.side_effect = err
+
+        with patch("src.drive_client.time.sleep"):
+            with pytest.raises(DriveFileNotFoundError) as excinfo:
+                drive_client.upload(local, "a.md", existing_id="missing")
+
+        assert excinfo.value.file_id == "missing"
+
+    def test_find_folder_404_does_not_convert(self, drive_client):
+        """find_folder는 파일 조작이 아니므로 404를 DriveFileNotFoundError로 변환하지 않는다."""
+        err = _make_http_error(404)
+        req = drive_client._service.files().list.return_value
+        req.execute.side_effect = err
+
+        with patch("src.drive_client.time.sleep"):
+            with pytest.raises(HttpError):
+                drive_client.find_folder("name", "parent")
+
+
+class TestNestedUploadIntegration:
+    """upload()가 nested path 에서 ensure_folder_path를 트리거하는지 종단 검증."""
+
+    def test_upload_nested_path_creates_parent_folders(self, drive_client, tmp_path):
+        local = tmp_path / "note.md"
+        local.write_text("hi", encoding="utf-8")
+
+        # find_folder는 없음을 반환 → create_folder로 생성
+        list_req = drive_client._service.files().list.return_value
+        list_req.execute.return_value = {"files": []}
+
+        # create_folder는 순차적으로 반환
+        create_req = drive_client._service.files().create.return_value
+        # foo 폴더 생성, foo/bar 폴더 생성, 실제 파일 생성 (create 3번)
+        create_req.execute.side_effect = [
+            {"id": "foo_id"},
+            {"id": "foo_bar_id"},
+            {"id": "file_id"},
+        ]
+
+        file_id = drive_client.upload(local, "foo/bar/note.md")
+
+        assert file_id == "file_id"
+        # _folder_cache에 foo, foo/bar 등록됨
+        assert drive_client._folder_cache["foo"] == "foo_id"
+        assert drive_client._folder_cache["foo/bar"] == "foo_bar_id"

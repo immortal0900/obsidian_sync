@@ -12,6 +12,7 @@ import pytest
 
 from src.config import SyncConfig
 from src.conflict import ConflictResolver
+from src.drive_client import DriveFileNotFoundError
 from src.state import FileEntry, SyncState
 from src.sync_engine import (
     ACTION_CONFLICT,
@@ -380,3 +381,72 @@ def test_unknown_action_type_is_logged(
     engine.execute({"type": "nonsense"})
     # 예외 없이 종료 + 잠금 해제
     assert engine.lock is False
+
+
+# ── Sprint 3: 404 정리 ──────────────────────────────────────────────────
+
+
+def test_delete_remote_404_removes_state_entry(
+    engine: SyncEngine, state: SyncState, drive: MagicMock, vault: Path
+) -> None:
+    """delete가 404를 받으면 sync_engine이 state에서 해당 drive_id를 제거한다."""
+    state.files["note.md"] = FileEntry(mtime=1.0, size=1, drive_id="missing")
+    drive.delete.side_effect = DriveFileNotFoundError("missing")
+
+    engine.execute(
+        {
+            "type": ACTION_DELETE_REMOTE,
+            "file_id": "missing",
+            "path": "note.md",
+        }
+    )
+
+    assert "note.md" not in state.files
+    assert engine.lock is False
+
+
+def test_download_404_removes_state_entry(
+    engine: SyncEngine, state: SyncState, drive: MagicMock
+) -> None:
+    """download 중 404 발생 시 state에서 drive_id 제거."""
+    state.files["gone.md"] = FileEntry(mtime=1.0, size=1, drive_id="fid_gone")
+    drive.download.side_effect = DriveFileNotFoundError("fid_gone")
+
+    engine.execute(
+        {"type": ACTION_DOWNLOAD, "file_id": "fid_gone", "path": "gone.md"}
+    )
+
+    assert "gone.md" not in state.files
+
+
+def test_rename_404_removes_state_entry(
+    engine: SyncEngine, state: SyncState, drive: MagicMock
+) -> None:
+    """rename_remote에서 404 발생 시 대상 경로의 state 정리."""
+    state.files["old.md"] = FileEntry(mtime=1.0, size=1, drive_id="fid_missing")
+    drive.rename.side_effect = DriveFileNotFoundError("fid_missing")
+
+    engine.execute(
+        {
+            "type": ACTION_RENAME_REMOTE,
+            "old_path": "old.md",
+            "new_path": "new.md",
+        }
+    )
+
+    # 존재하지 않는 drive_id → state에서 제거
+    assert "old.md" not in state.files
+
+
+def test_404_cleanup_without_path_hint(
+    engine: SyncEngine, state: SyncState, drive: MagicMock
+) -> None:
+    """path 힌트가 없어도 drive_id 전체 스캔으로 정리한다."""
+    state.files["a.md"] = FileEntry(mtime=1.0, size=1, drive_id="orphan")
+    state.files["b.md"] = FileEntry(mtime=2.0, size=2, drive_id="keep")
+    drive.delete.side_effect = DriveFileNotFoundError("orphan")
+
+    engine.execute({"type": ACTION_DELETE_REMOTE, "file_id": "orphan"})
+
+    assert "a.md" not in state.files
+    assert "b.md" in state.files
