@@ -281,7 +281,12 @@ class Reconciler:
                     "path": path,
                     "reason": f"remote_{remote_kind}",
                 }
-            # unchanged × unchanged, unchanged × deleted → no-op
+            if remote_kind == REMOTE_DELETED:
+                # decision-003: no-op 유지하되 유령 drive_id 정리.
+                # 로컬 파일은 보존 (Policy 1). 다음 로컬 수정 시 재업로드로 복구.
+                self._state.remove_file(path)
+                return None
+            # unchanged × unchanged → no-op
             return None
 
         # 로컬: 새 파일 ────────────────────────────────────────────────

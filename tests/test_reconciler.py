@@ -133,9 +133,10 @@ def test_cell_unchanged_x_modified_download(
     assert actions[0]["path"] == "b.md"
 
 
-def test_cell_unchanged_x_deleted_noop(
+def test_cell_unchanged_x_deleted_noop_but_cleans_state_entry(
     reconciler: Reconciler, state: SyncState, vault: Path, drive: MagicMock
 ) -> None:
+    """decision-003: no-op 유지 + state entry 제거 (유령 drive_id 방지)."""
     _write(vault, "c.md", b"x", mtime=100.0)
     state.files["c.md"] = FileEntry(mtime=100.0, size=1, drive_id="id_c")
     drive.get_changes.return_value = ([_change("id_c", removed=True)], "tok1")
@@ -143,6 +144,10 @@ def test_cell_unchanged_x_deleted_noop(
     actions = reconciler.run()
     # spec: "이미 없음" → no-op
     assert actions == []
+    # decision-003: 유령 drive_id 정리
+    assert "c.md" not in state.files
+    # 로컬 파일은 보존됨 (Policy 1: 데이터 손실 방지)
+    assert (vault / "c.md").exists()
 
 
 # 2행: 로컬 new
