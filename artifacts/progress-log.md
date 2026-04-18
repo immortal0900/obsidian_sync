@@ -1,5 +1,57 @@
 # Progress Log
 
+## Sprint 2 — Session 1 (2026-04-19)
+
+**Sprint Contract 진행률**: 5/5 P0 + DoD 전체 완료 (100%)
+
+### 완료한 작업
+
+1. **P0-1: drive_vv_codec 구현** (`11a68df`)
+   - `src/drive_vv_codec.py` 신규: encode/decode 왕복 변환, trim(28), legacy fallback
+   - `tests/test_drive_vv_codec.py`: 29 tests — 왕복, trim, 바이트 실측, 엣지 케이스
+
+2. **P0-2: drive_client.py 확장** (`e97fcbd`)
+   - upload 시그니처에 `app_properties` kwarg 추가, 반환값 str→dict 변경
+   - `download` 반환값에 메타데이터(md5Checksum, appProperties) 포함
+   - `delete()` → `hard_delete()` rename
+   - 신규: `ensure_tombstones_folder()`, `move_to_tombstones()`
+   - `list_all_files()` fields에 `md5Checksum`, `appProperties` 추가
+   - `get_changes()` fields에 `appProperties` 추가
+   - `_normalize_change`에서 tombstones 폴더 parents 감지 → removed=True
+   - 기존 테스트 전면 업데이트 + 신규 tombstone 테스트 4개
+
+3. **P0-3: sync_engine.py 통합** (`eadda52`)
+   - `_do_upload`: vv_encode → appProperties에 version vector 전달, Drive md5Checksum 저장
+   - `_do_download`: vv_decode → 원격 vector를 로컬 version에 반영 (Sprint 1 QA -1점 해소)
+   - `_do_delete_remote`: hard_delete → move_to_tombstones 교체 + appProperties 갱신
+   - e2e_smoke, integration_watcher_poller 테스트 mock 업데이트
+
+4. **P0-4: tombstones 폴더 방어** (`374ac36`)
+   - `main.py`: 부트 시 `ensure_tombstones_folder()` 호출 + WARNING 로그
+   - tombstones change detection 테스트 2개 추가
+
+5. **P0-5: md5 조기 도입** (`9bc44a9`)
+   - upload/download 시 Drive API md5Checksum → FileEntry.md5 기록
+   - Google Docs(md5=None) graceful 처리 테스트 포함
+   - download 시 원격 appProperties vector 반영 테스트
+
+### 내린 결정과 이유
+
+- **upload 반환값 str→dict 변경**: md5Checksum, appProperties를 받기 위해 필수. 기존 호출부 전면 업데이트.
+- **_do_delete_remote에서 path 유무 분기**: path가 있으면 move_to_tombstones(vector 보존), 없으면 hard_delete fallback. 404 정리 경로와의 호환성 유지.
+- **download에서 원격 vector 우선 적용**: remote_vv가 있으면 그대로 사용, legacy(empty)이면 로컬 갱신. 이로써 Sprint 1 QA의 `-1점` 감점 원인이 해소됨.
+
+### 미처리 이슈
+
+- Sprint 1 QA 권고사항(에코 억제 테스트, prefix 충돌 양성 테스트, trash_retention config 테스트)은 P1 비차단으로 이번 스프린트에서도 미구현. PR3/PR4에서 자연스럽게 추가 예정.
+
+### 다음 세션에서 해야 할 것
+
+1. **Evaluator 실행**: Sprint 2 QA → PASS 판정
+2. **Sprint 3 착수**: PR3 — 3-way Reconciler 재설계 + 충돌 해결 + md5 로컬 계산
+
+---
+
 ## Sprint 1 — Session 3 (2026-04-19)
 
 **Sprint Contract 진행률**: 5/5 P0 + DoD 전체 완료 (100%) — QA FAIL 수정 완료
