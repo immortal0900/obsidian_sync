@@ -230,6 +230,7 @@ class SyncEngine:
 
     def _do_upload(self, action: dict) -> None:
         from src.drive_vv_codec import encode as vv_encode
+        from src.hash import compute_md5
 
         path: str = action["path"]
         local_abs = self._state.vault_path / path
@@ -242,8 +243,11 @@ class SyncEngine:
         old_version = existing.version if existing else VersionVector.empty()
         new_version = old_version.update(self._state.device_id)
 
+        # Compute local md5
+        local_md5 = compute_md5(local_abs)
+
         # appProperties에 version vector 인코딩
-        app_props = vv_encode(new_version, deleted=False, md5=existing.md5 if existing else None)
+        app_props = vv_encode(new_version, deleted=False, md5=local_md5)
 
         result = self._drive.upload(
             local_abs, path, existing_id=existing_id, app_properties=app_props
@@ -261,7 +265,7 @@ class SyncEngine:
                 size=stat.st_size,
                 drive_id=drive_id,
                 version=new_version,
-                md5=drive_md5,
+                md5=drive_md5 or local_md5,
             ),
         )
         self._mark_drive_written(drive_id)
@@ -269,6 +273,7 @@ class SyncEngine:
 
     def _do_download(self, action: dict) -> None:
         from src.drive_vv_codec import decode as vv_decode
+        from src.hash import compute_md5
 
         file_id: str = action["file_id"]
         path: str = action["path"]
@@ -291,8 +296,9 @@ class SyncEngine:
             old_version = existing.version if existing else VersionVector.empty()
             new_version = old_version.update(self._state.device_id)
 
-        # Drive API md5Checksum 저장
+        # Drive API md5Checksum + local compute_md5
         drive_md5 = meta.get("md5Checksum") if isinstance(meta, dict) else None
+        local_md5 = compute_md5(local_abs)
 
         self._state.update_file(
             path,
@@ -301,7 +307,7 @@ class SyncEngine:
                 size=stat.st_size,
                 drive_id=file_id,
                 version=new_version,
-                md5=drive_md5 or remote_md5,
+                md5=drive_md5 or local_md5 or remote_md5,
             ),
         )
         logger.info(f"동기화 완료 (download): {path}")

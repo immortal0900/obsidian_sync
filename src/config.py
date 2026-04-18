@@ -83,6 +83,8 @@ class SyncConfig:
     debounce_seconds: float = 2.0
     delete_local: bool = False
     trash_retention_days: int = DEFAULT_TRASH_RETENTION_DAYS
+    hash_max_file_size_mb: int = 100
+    hash_verification: bool = True
     log_level: str = "INFO"
     log_file: str = "obsidian_sync.log"
     log_max_bytes: int = 5 * 1024 * 1024
