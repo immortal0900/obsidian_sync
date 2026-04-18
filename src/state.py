@@ -339,6 +339,10 @@ class SyncState:
         """두 파일 목록을 비교해서 추가/수정/삭제를 분류한다.
 
         수정 판정 기준: mtime 또는 size가 다른 경우.
+
+        .. deprecated:: v2
+            PR3에서 reconciler가 version compare 기반으로 재작성되면서
+            이 메서드는 더 이상 사용되지 않는다. 하위 호환을 위해 유지.
         """
         old_keys = set(old_files.keys())
         new_keys = set(new_files.keys())

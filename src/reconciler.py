@@ -1,182 +1,558 @@
-"""재시작 시 로컬/클라우드 상태를 대조하여 밀린 변경을 합친다.
+"""Version-vector based 3-way reconciler (spec §3.3, §3.7).
 
-- `run()`: 상태 파일이 있을 때 — 저장된 page_token으로 증분 대조.
-- `run_without_state()`: 첫 실행 또는 상태 파일 분실 시 — 전체 목록 대조.
+Replaces the legacy 16-cell classify/decide matrix with version compare.
 
-대조 규칙표(spec §5-6)에 따라 action 리스트를 생성한다.
-실제 실행은 호출자(SyncEngine)가 담당한다.
+- ``run()``: incremental reconciliation (state file exists).
+- ``run_without_state()``: full-list reconciliation (first run / state lost).
+- ``decide()``: per-path action decision based on VectorOrdering.
+- ``resolve_conflict()``: Syncthing HLC tiebreaker.
 """
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
 from src.config import should_ignore
 from src.drive_client import DriveClient
+from src.drive_vv_codec import decode as vv_decode
+from src.hash import compute_md5
 from src.state import FileEntry, SyncState
+from src.version_vector import VectorOrdering, VersionVector
 
 logger = logging.getLogger(__name__)
 
-# 로컬 파일 분류
-LOCAL_UNCHANGED = "unchanged"
-LOCAL_NEW = "new"
-LOCAL_MODIFIED = "modified"
-LOCAL_DELETED = "deleted"
 
-# 원격 변경 분류
-REMOTE_UNCHANGED = "unchanged"
-REMOTE_NEW = "new"
-REMOTE_MODIFIED = "modified"
-REMOTE_DELETED = "deleted"
+# ── Action types ──────────────────────────────────────────────────────
+
+
+@dataclass
+class NoOp:
+    reason: str = ""
+
+
+@dataclass
+class Upload:
+    conflict_copy_of: FileEntry | None = None
+
+
+@dataclass
+class Download:
+    file_id: str = ""
+    conflict_copy_of: FileEntry | None = None
+
+
+@dataclass
+class DeleteRemote:
+    file_id: str = ""
+
+
+@dataclass
+class DeleteLocal:
+    pass
+
+
+@dataclass
+class UpdateVectorOnly:
+    merged: VersionVector | None = None
+
+
+@dataclass
+class AbsorbRemoteTombstone:
+    """Copy remote deleted=True to local state only (no file op)."""
+    remote_entry: FileEntry | None = None
+
+
+Action = NoOp | Upload | Download | DeleteRemote | DeleteLocal | UpdateVectorOnly | AbsorbRemoteTombstone
+
+
+# ── Core decision functions ───────────────────────────────────────────
+
+
+def decide(
+    local: FileEntry | None,
+    remote: FileEntry | None,
+) -> Action:
+    """Decide sync action for a single path (spec §3.3)."""
+    if local is None and remote is None:
+        return NoOp()
+
+    if local is None:
+        return decide_download_or_delete(remote)  # type: ignore[arg-type]
+
+    if remote is None:
+        return decide_upload_or_delete(local)
+
+    # Both exist
+    # Content identical → vector merge only
+    if (
+        local.md5 is not None
+        and remote.md5 is not None
+        and local.md5 == remote.md5
+        and local.size == remote.size
+    ):
+        return UpdateVectorOnly(merged=local.version.merge(remote.version))
+
+    ordering = local.version.compare(remote.version)
+
+    if ordering == VectorOrdering.Equal:
+        return NoOp()
+
+    if ordering == VectorOrdering.Greater:
+        if local.deleted:
+            return DeleteRemote(file_id=remote.drive_id or "")
+        return Upload()
+
+    if ordering == VectorOrdering.Lesser:
+        if remote.deleted:
+            return DeleteLocal()
+        return Download(file_id=remote.drive_id or "")
+
+    # Concurrent
+    return resolve_conflict(local, remote)
+
+
+def decide_download_or_delete(remote: FileEntry) -> Action:
+    """Remote-only path: download or absorb tombstone (spec §3.3)."""
+    if remote.deleted:
+        return AbsorbRemoteTombstone(remote_entry=remote)
+    return Download(file_id=remote.drive_id or "")
+
+
+def decide_upload_or_delete(local: FileEntry) -> Action:
+    """Local-only path: upload or no-op for local tombstone (spec §3.3)."""
+    if local.deleted:
+        return NoOp(reason="local_tombstone_no_remote")
+    return Upload()
+
+
+def resolve_conflict(local: FileEntry, remote: FileEntry) -> Action:
+    """Syncthing HLC tiebreaker for concurrent vectors (spec §3.3).
+
+    1. max(version.counters.values()) — higher HLC wins.
+    2. HLC tie → device prefix (lexicographic greater loses).
+    """
+    local_hlc = max(local.version.counters.values()) if local.version.counters else 0
+    remote_hlc = max(remote.version.counters.values()) if remote.version.counters else 0
+
+    if local_hlc > remote_hlc:
+        # Local wins → upload, preserve remote as conflict copy
+        return Upload(conflict_copy_of=remote)
+    if remote_hlc > local_hlc:
+        # Remote wins → download, preserve local as conflict copy
+        return Download(
+            file_id=remote.drive_id or "",
+            conflict_copy_of=local,
+        )
+
+    # HLC tie → device prefix comparison (larger prefix loses)
+    local_dev = max(local.version.counters.keys()) if local.version.counters else ""
+    remote_dev = max(remote.version.counters.keys()) if remote.version.counters else ""
+    if local_dev > remote_dev:
+        # Local prefix is larger → local loses → download remote
+        return Download(
+            file_id=remote.drive_id or "",
+            conflict_copy_of=local,
+        )
+    return Upload(conflict_copy_of=remote)
+
+
+# ── Reconciler class ─────────────────────────────────────────────────
 
 
 class Reconciler:
-    """재시작 시 양쪽 상태를 합치고 action 리스트를 생성한다."""
+    """Reconciles local and remote state using version vectors."""
 
-    def __init__(self, state: SyncState, drive: DriveClient) -> None:
+    def __init__(
+        self,
+        state: SyncState,
+        drive: DriveClient,
+        *,
+        hash_max_bytes: int | None = None,
+    ) -> None:
         self._state = state
         self._drive = drive
+        self._hash_max_bytes = hash_max_bytes
 
-    # ── run (상태 파일 존재) ────────────────────────────────────────────
+    # ── run (state file exists) ──────────────────────────────────────
 
     def run(self) -> list[dict]:
-        """증분 대조 알고리즘.
-
-        전제: 호출자가 이미 `state.load()`로 인메모리 상태를 채운 상태.
-        """
+        """Incremental reconciliation using version compare."""
         old_files: dict[str, FileEntry] = dict(self._state.files)
         new_files: dict[str, FileEntry] = self._state.scan_local_files()
 
-        # 로컬 분류
-        local_kinds = self._classify_local(old_files, new_files)
+        # Detect local changes by comparing old vs new
+        local_changes = self._detect_local_changes(old_files, new_files)
 
-        # 원격 분류
-        remote_kinds, new_token = self._classify_remote()
+        # Get remote changes
+        remote_changes, new_token = self._classify_remote()
 
-        # 대조 + action 생성
-        actions = self._apply_rules(
-            old_files, new_files, local_kinds, remote_kinds
-        )
+        # Build actions
+        actions: list[dict] = []
+        all_paths = sorted(set(local_changes) | set(remote_changes))
 
-        # page_token 갱신 (저장은 execute 이후 호출자가 수행)
+        for path in all_paths:
+            if should_ignore(path):
+                continue
+
+            local_entry = local_changes.get(path)
+            remote_info = remote_changes.get(path)
+
+            action = self._decide_incremental(
+                path, local_entry, remote_info, old_files, new_files
+            )
+            if action is not None:
+                actions.append(action)
+
         if new_token:
             self._state.page_token = new_token
 
         logger.info(
-            f"reconciler.run: 로컬 변화 {len(local_kinds)}건, "
-            f"원격 변화 {len(remote_kinds)}건 → {len(actions)}개 action"
+            f"reconciler.run: local changes {len(local_changes)}, "
+            f"remote changes {len(remote_changes)} -> {len(actions)} actions"
         )
         return actions
 
-    # ── run_without_state (첫 실행/상태 분실) ────────────────────────────
+    def _detect_local_changes(
+        self,
+        old_files: dict[str, FileEntry],
+        new_files: dict[str, FileEntry],
+    ) -> dict[str, dict[str, Any]]:
+        """Detect local file changes between old and new scan."""
+        changes: dict[str, dict[str, Any]] = {}
+        old_keys = set(old_files)
+        new_keys = set(new_files)
+
+        for p in new_keys - old_keys:
+            changes[p] = {"kind": "new", "entry": new_files[p]}
+        for p in old_keys - new_keys:
+            if not old_files[p].deleted:
+                changes[p] = {"kind": "deleted", "entry": old_files[p]}
+        for p in old_keys & new_keys:
+            old_e = old_files[p]
+            new_e = new_files[p]
+            if old_e.mtime != new_e.mtime or old_e.size != new_e.size:
+                changes[p] = {"kind": "modified", "entry": new_files[p]}
+
+        return changes
+
+    def _decide_incremental(
+        self,
+        path: str,
+        local_change: dict[str, Any] | None,
+        remote_info: dict[str, Any] | None,
+        old_files: dict[str, FileEntry],
+        new_files: dict[str, FileEntry],
+    ) -> dict | None:
+        """Decide action for a single path during incremental sync."""
+        # Build local FileEntry
+        local_entry: FileEntry | None = None
+        if local_change is not None:
+            kind = local_change["kind"]
+            entry = local_change["entry"]
+            if kind in ("new", "modified"):
+                # Compute md5 for the local file
+                local_abs = self._state.vault_path / path
+                md5 = compute_md5(local_abs, max_bytes=self._hash_max_bytes)
+                new_version = entry.version.update(self._state.device_id)
+                local_entry = FileEntry(
+                    mtime=entry.mtime,
+                    size=entry.size,
+                    drive_id=entry.drive_id,
+                    version=new_version,
+                    md5=md5,
+                )
+            elif kind == "deleted":
+                new_version = entry.version.update(self._state.device_id)
+                local_entry = FileEntry(
+                    mtime=entry.mtime,
+                    size=entry.size,
+                    drive_id=entry.drive_id,
+                    version=new_version,
+                    deleted=True,
+                )
+        else:
+            # No local change — use existing state
+            existing = new_files.get(path) or old_files.get(path)
+            if existing is not None:
+                local_entry = existing
+
+        # Build remote FileEntry
+        remote_entry: FileEntry | None = None
+        if remote_info is not None:
+            remote_entry = self._remote_info_to_entry(remote_info, path)
+        elif local_entry is not None and local_entry.deleted and local_entry.drive_id:
+            # Local deleted + no remote change → remote still exists in its last state
+            old_entry = old_files.get(path)
+            if old_entry is not None and old_entry.drive_id:
+                remote_entry = FileEntry(
+                    mtime=old_entry.mtime,
+                    size=old_entry.size,
+                    drive_id=old_entry.drive_id,
+                    version=old_entry.version,  # unchanged remote version
+                )
+
+        if local_entry is None and remote_entry is None:
+            return None
+
+        action = decide(local_entry, remote_entry)
+        return self._action_to_dict(action, path, local_entry, remote_entry)
+
+    def _remote_info_to_entry(
+        self, remote_info: dict[str, Any], path: str
+    ) -> FileEntry | None:
+        """Convert raw remote change info to FileEntry."""
+        kind = remote_info.get("kind", "")
+        file_id = remote_info.get("file_id", "")
+        file_meta = remote_info.get("file")
+
+        if kind == "deleted":
+            # Remote file was deleted/removed
+            existing = self._state.files.get(path)
+            old_version = existing.version if existing else VersionVector.empty()
+            return FileEntry(
+                mtime=0.0,
+                size=0,
+                drive_id=file_id,
+                version=old_version.update("_remote_"),  # different device
+                deleted=True,
+            )
+
+        if file_meta is None:
+            return None
+
+        # Parse appProperties for version vector
+        app_props = file_meta.get("appProperties")
+        remote_vv, deleted, remote_md5 = vv_decode(app_props)
+        if not remote_vv:
+            remote_vv = VersionVector.empty()
+
+        remote_mtime = _parse_rfc3339(file_meta.get("modifiedTime"))
+        md5 = file_meta.get("md5Checksum") or remote_md5
+
+        return FileEntry(
+            mtime=remote_mtime,
+            size=int(file_meta.get("size", 0)),
+            drive_id=file_id,
+            version=remote_vv,
+            deleted=deleted,
+            md5=md5,
+        )
+
+    # ── run_without_state (first run / state lost) ───────────────────
 
     def run_without_state(self) -> list[dict]:
-        """전체 목록 대조로 초기 상태를 구축한다.
+        """Full-list reconciliation (spec §3.7).
 
-        매칭은 볼트 기준 상대 경로(POSIX)로 수행한다.
+        Five branches:
+        1. Both exist + md5 match → no transfer, vector merge.
+        2. Local only → upload.
+        3. Remote only → download.
+        4. Both exist + md5 differ + local.version==empty → forced Conflict (P0 1-B).
+        5. Tombstone only → absorb deleted=True.
         """
         remote_files = self._drive.list_all_files()
-        # remote_files의 각 항목에는 drive_client가 부여한 relative_path 있음.
-        # IGNORE_PATTERNS에 해당하는 원격 파일은 로컬로 내려받지 않는다.
-        remote_by_path: dict[str, dict[str, Any]] = {
-            item["relative_path"]: item
-            for item in remote_files
-            if not should_ignore(item["relative_path"])
-        }
+        remote_by_path: dict[str, dict[str, Any]] = {}
+        tombstone_by_path: dict[str, dict[str, Any]] = {}
+
+        for item in remote_files:
+            rel_path = item.get("relative_path", item.get("name", ""))
+            if should_ignore(rel_path):
+                continue
+            # Check if this is a tombstone
+            app_props = item.get("appProperties")
+            if app_props:
+                _, deleted, _ = vv_decode(app_props)
+                if deleted:
+                    tombstone_by_path[rel_path] = item
+                    continue
+            remote_by_path[rel_path] = item
+
         local_files = self._state.scan_local_files()
 
         actions: list[dict] = []
-        all_paths = set(local_files) | set(remote_by_path)
+        all_paths = sorted(set(local_files) | set(remote_by_path) | set(tombstone_by_path))
 
-        for path in sorted(all_paths):
+        for path in all_paths:
             local_entry = local_files.get(path)
             remote_meta = remote_by_path.get(path)
+            tombstone_meta = tombstone_by_path.get(path)
 
-            if local_entry is not None and remote_meta is None:
-                # 로컬에만 존재 → 업로드
-                actions.append(
-                    {"type": "upload", "path": path, "reason": "init_local_only"}
-                )
-            elif local_entry is None and remote_meta is not None:
-                # 원격에만 존재 → 다운로드
-                actions.append(
-                    {
-                        "type": "download",
-                        "file_id": remote_meta["id"],
-                        "path": path,
-                        "reason": "init_remote_only",
-                    }
-                )
-            else:
-                # 양쪽 존재 → 최신 우선 (재설치 시나리오, 충돌로 간주하지 않음)
-                remote_mtime = _parse_rfc3339(remote_meta.get("modifiedTime"))
-                local_mtime = local_entry.mtime if local_entry else 0.0
-                if remote_mtime > local_mtime:
-                    actions.append(
-                        {
-                            "type": "download",
-                            "file_id": remote_meta["id"],
-                            "path": path,
-                            "reason": "init_remote_newer",
-                        }
-                    )
-                elif local_mtime > remote_mtime:
-                    actions.append(
-                        {"type": "upload", "path": path, "reason": "init_local_newer"}
-                    )
-                # 같으면 no-op, 단 state에는 drive_id를 기록해야 함
-                # → 호출자가 action 실행 후 state.save()로 반영됨. 여기서는 간단히 갱신.
-                if local_entry is not None and remote_meta is not None:
-                    # 매칭된 항목은 인메모리 state에 drive_id 반영
-                    entry = FileEntry(
-                        mtime=local_entry.mtime,
-                        size=local_entry.size,
-                        drive_id=remote_meta["id"],
-                    )
-                    self._state.files[path] = entry
+            action = self._decide_without_state(
+                path, local_entry, remote_meta, tombstone_meta
+            )
+            if action is not None:
+                actions.append(action)
 
-        # 새 page_token 발급
+        # Issue new page_token
         token = self._drive.get_initial_token()
         self._state.page_token = token
 
         logger.info(
-            f"reconciler.run_without_state: 로컬 {len(local_files)}개, "
-            f"원격 {len(remote_by_path)}개 → {len(actions)}개 action, "
-            f"new_token={token}"
+            f"reconciler.run_without_state: local {len(local_files)}, "
+            f"remote {len(remote_by_path)}, tombstones {len(tombstone_by_path)} "
+            f"-> {len(actions)} actions, new_token={token}"
         )
         return actions
 
-    # ── 분류 ──────────────────────────────────────────────────────────────
-
-    def _classify_local(
+    def _decide_without_state(
         self,
-        old_files: dict[str, FileEntry],
-        new_files: dict[str, FileEntry],
-    ) -> dict[str, str]:
-        """로컬 diff를 path → kind 매핑으로 변환한다."""
-        diff = self._state.diff(old_files, new_files)
-        result: dict[str, str] = {}
-        for p in diff.added:
-            result[p] = LOCAL_NEW
-        for p in diff.modified:
-            result[p] = LOCAL_MODIFIED
-        for p in diff.deleted:
-            result[p] = LOCAL_DELETED
-        return result
+        path: str,
+        local_entry: FileEntry | None,
+        remote_meta: dict[str, Any] | None,
+        tombstone_meta: dict[str, Any] | None,
+    ) -> dict | None:
+        """Per-path decision for run_without_state (spec §3.7)."""
+        if local_entry is None and remote_meta is None and tombstone_meta is None:
+            return None
+
+        # Branch 5: Tombstone only (no local, no active remote)
+        if local_entry is None and remote_meta is None and tombstone_meta is not None:
+            return self._absorb_tombstone(path, tombstone_meta)
+
+        # Branch 3: Remote only → download
+        if local_entry is None and remote_meta is not None:
+            file_id = remote_meta["id"]
+            # Register drive_id in state
+            app_props = remote_meta.get("appProperties")
+            remote_vv, _, remote_md5 = vv_decode(app_props)
+            self._state.files[path] = FileEntry(
+                mtime=0.0,
+                size=0,
+                drive_id=file_id,
+                version=remote_vv if remote_vv else VersionVector.empty(),
+                md5=remote_md5,
+            )
+            return {
+                "type": "download",
+                "file_id": file_id,
+                "path": path,
+                "reason": "init_remote_only",
+            }
+
+        # Branch 2: Local only (no remote, maybe tombstone)
+        if local_entry is not None and remote_meta is None:
+            if tombstone_meta is not None:
+                # Local exists but remote tombstone → compare versions
+                app_props = tombstone_meta.get("appProperties")
+                remote_vv, _, _ = vv_decode(app_props)
+                if remote_vv and local_entry.version.compare(remote_vv) == VectorOrdering.Lesser:
+                    # Tombstone wins → delete local
+                    return {
+                        "type": "delete_local",
+                        "path": path,
+                        "reason": "init_tombstone_wins",
+                    }
+            return {
+                "type": "upload",
+                "path": path,
+                "reason": "init_local_only",
+            }
+
+        # Both exist
+        if local_entry is not None and remote_meta is not None:
+            file_id = remote_meta["id"]
+            app_props = remote_meta.get("appProperties")
+            remote_vv, _, remote_md5 = vv_decode(app_props)
+            drive_md5 = remote_meta.get("md5Checksum") or remote_md5
+
+            # Compute local md5
+            local_abs = self._state.vault_path / path
+            local_md5 = compute_md5(local_abs, max_bytes=self._hash_max_bytes)
+
+            # Branch 1: md5 match → no transfer, merge vectors
+            if local_md5 is not None and drive_md5 is not None and local_md5 == drive_md5:
+                merged = local_entry.version.merge(
+                    remote_vv if remote_vv else VersionVector.empty()
+                )
+                self._state.files[path] = FileEntry(
+                    mtime=local_entry.mtime,
+                    size=local_entry.size,
+                    drive_id=file_id,
+                    version=merged,
+                    md5=local_md5,
+                )
+                return None  # No transfer needed
+
+            # Branch 4: md5 differ + local.version==empty → forced Conflict (P0 1-B)
+            if not local_entry.version.counters:
+                # State was lost — force conflict to protect local edits
+                self._state.files[path] = FileEntry(
+                    mtime=local_entry.mtime,
+                    size=local_entry.size,
+                    drive_id=file_id,
+                    version=local_entry.version,
+                    md5=local_md5,
+                )
+                return {
+                    "type": "conflict",
+                    "path": path,
+                    "local": {
+                        "mtime": local_entry.mtime,
+                        "size": local_entry.size,
+                    },
+                    "remote": {
+                        "file_id": file_id,
+                        "md5": drive_md5,
+                    },
+                    "reason": "init_state_lost_conflict",
+                }
+
+            # Both exist + md5 differ + local.version != empty → normal decide
+            remote_entry = FileEntry(
+                mtime=_parse_rfc3339(remote_meta.get("modifiedTime")),
+                size=int(remote_meta.get("size", 0)),
+                drive_id=file_id,
+                version=remote_vv if remote_vv else VersionVector.empty(),
+                md5=drive_md5,
+            )
+            local_with_md5 = FileEntry(
+                mtime=local_entry.mtime,
+                size=local_entry.size,
+                drive_id=local_entry.drive_id or file_id,
+                version=local_entry.version,
+                md5=local_md5,
+            )
+            action = decide(local_with_md5, remote_entry)
+            result = self._action_to_dict(action, path, local_with_md5, remote_entry)
+
+            # Always register drive_id
+            self._state.files[path] = FileEntry(
+                mtime=local_entry.mtime,
+                size=local_entry.size,
+                drive_id=file_id,
+                version=local_entry.version,
+                md5=local_md5,
+            )
+            return result
+
+        return None
+
+    def _absorb_tombstone(
+        self, path: str, tombstone_meta: dict[str, Any]
+    ) -> dict | None:
+        """Record tombstone in local state without file operations."""
+        app_props = tombstone_meta.get("appProperties")
+        remote_vv, _, _ = vv_decode(app_props)
+        file_id = tombstone_meta.get("id", "")
+
+        self._state.files[path] = FileEntry(
+            mtime=0.0,
+            size=0,
+            drive_id=file_id,
+            version=remote_vv if remote_vv else VersionVector.empty(),
+            deleted=True,
+        )
+        logger.debug(f"Absorbed remote tombstone: {path}")
+        return None  # No file operation needed
+
+    # ── Remote classification ────────────────────────────────────────
 
     def _classify_remote(self) -> tuple[dict[str, dict[str, Any]], str | None]:
-        """원격 변경을 path → {kind, file_id, file} 매핑으로 변환한다.
-
-        - 기존 drive_id와 일치하면 기존 경로로 매핑 (modified 또는 deleted).
-        - 알 수 없는 drive_id + removed=False면 file.name을 path로 사용 (new).
-        - 알 수 없는 drive_id + removed=True는 무시 (추적하지 않는 파일의 삭제).
-
-        반환: (remote_kinds, new_page_token).
-        """
+        """Classify remote changes from Changes API."""
         token = self._state.page_token
         if not token:
-            # 토큰 없음 → 증분 대조 불가 (run_without_state가 호출되어야 함)
             return {}, None
 
         changes, new_token = self._drive.get_changes(token)
@@ -192,21 +568,23 @@ class Reconciler:
             if removed:
                 if known_path is not None:
                     remote_kinds[known_path] = {
-                        "kind": REMOTE_DELETED,
+                        "kind": "deleted",
                         "file_id": file_id,
                         "file": None,
                     }
-                # 알 수 없는 파일의 삭제 → 무시
                 continue
 
             if file_meta is None:
                 continue
 
+            # Apply IGNORE_PATTERNS to remote changes
+            rel_path = known_path or file_meta.get("name", "")
+            if should_ignore(rel_path):
+                continue
+
             if known_path is not None:
-                if should_ignore(known_path):
-                    continue
                 remote_kinds[known_path] = {
-                    "kind": REMOTE_MODIFIED,
+                    "kind": "modified",
                     "file_id": file_id,
                     "file": file_meta,
                 }
@@ -214,10 +592,8 @@ class Reconciler:
                 name = file_meta.get("name")
                 if not name:
                     continue
-                if should_ignore(name):
-                    continue
                 remote_kinds[name] = {
-                    "kind": REMOTE_NEW,
+                    "kind": "new",
                     "file_id": file_id,
                     "file": file_meta,
                 }
@@ -225,161 +601,121 @@ class Reconciler:
         return remote_kinds, new_token
 
     def _path_by_drive_id(self, file_id: str) -> str | None:
-        """상태의 files에서 drive_id가 일치하는 경로를 찾는다."""
         for path, entry in self._state.files.items():
             if entry.drive_id == file_id:
                 return path
         return None
 
-    # ── 규칙 적용 ────────────────────────────────────────────────────────
+    # ── Action dict conversion ───────────────────────────────────────
 
-    def _apply_rules(
+    def _action_to_dict(
         self,
-        old_files: dict[str, FileEntry],
-        new_files: dict[str, FileEntry],
-        local_kinds: dict[str, str],
-        remote_kinds: dict[str, dict[str, Any]],
-    ) -> list[dict]:
-        """16셀 대조 규칙을 적용해 action 리스트를 만든다."""
-        actions: list[dict] = []
-        all_paths = sorted(set(local_kinds) | set(remote_kinds))
-
-        for path in all_paths:
-            if should_ignore(path):
-                continue
-            local_kind = local_kinds.get(path, LOCAL_UNCHANGED)
-            remote_info = remote_kinds.get(
-                path, {"kind": REMOTE_UNCHANGED, "file_id": None, "file": None}
-            )
-            remote_kind = remote_info["kind"]
-
-            action = self._decide(
-                path, local_kind, remote_kind, remote_info, old_files, new_files
-            )
-            if action is not None:
-                actions.append(action)
-
-        return actions
-
-    def _decide(
-        self,
+        action: Action,
         path: str,
-        local_kind: str,
-        remote_kind: str,
-        remote_info: dict[str, Any],
-        old_files: dict[str, FileEntry],
-        new_files: dict[str, FileEntry],
+        local_entry: FileEntry | None,
+        remote_entry: FileEntry | None,
     ) -> dict | None:
-        """단일 셀의 action을 결정한다 (spec §5-6 그대로).
-
-        표 16셀:
-                        | 원격 unchanged | 원격 new  | 원격 modified | 원격 deleted
-            ------------|---------------|-----------|--------------|-------------
-            로컬 uncg.  | no-op         | download  | download     | no-op
-            로컬 new    | upload        | conflict  | n/a          | n/a
-            로컬 modif. | upload        | n/a       | conflict     | conflict
-            로컬 deleted| delete_remote | n/a       | conflict     | no-op
-        """
-        file_id = remote_info.get("file_id")
-
-        # 로컬: 변경 없음 ──────────────────────────────────────────────
-        if local_kind == LOCAL_UNCHANGED:
-            if remote_kind in (REMOTE_NEW, REMOTE_MODIFIED):
-                return {
-                    "type": "download",
-                    "file_id": file_id,
-                    "path": path,
-                    "reason": f"remote_{remote_kind}",
-                }
-            if remote_kind == REMOTE_DELETED:
-                # decision-003: no-op 유지하되 유령 drive_id 정리.
-                # 로컬 파일은 보존 (Policy 1). 다음 로컬 수정 시 재업로드로 복구.
-                self._state.remove_file(path)
-                return None
-            # unchanged × unchanged → no-op
+        """Convert typed Action to legacy dict format for sync_engine."""
+        if isinstance(action, NoOp):
             return None
 
-        # 로컬: 새 파일 ────────────────────────────────────────────────
-        if local_kind == LOCAL_NEW:
-            if remote_kind == REMOTE_UNCHANGED:
-                return {"type": "upload", "path": path, "reason": "local_new"}
-            if remote_kind == REMOTE_NEW:
-                return self._conflict_action(
-                    path, new_files.get(path), remote_info
+        if isinstance(action, Upload):
+            d: dict[str, Any] = {"type": "upload", "path": path, "reason": "version_greater"}
+            if action.conflict_copy_of is not None:
+                d["type"] = "conflict"
+                d["local"] = _entry_to_info(local_entry)
+                d["remote"] = _entry_to_info(remote_entry)
+                d["winner"] = "local"
+            return d
+
+        if isinstance(action, Download):
+            file_id = action.file_id or (remote_entry.drive_id if remote_entry else "")
+            d = {
+                "type": "download",
+                "file_id": file_id,
+                "path": path,
+                "reason": "version_lesser",
+            }
+            if action.conflict_copy_of is not None:
+                d["type"] = "conflict"
+                d["local"] = _entry_to_info(local_entry)
+                d["remote"] = _entry_to_info(remote_entry)
+                d["winner"] = "remote"
+            return d
+
+        if isinstance(action, DeleteRemote):
+            file_id = action.file_id or (remote_entry.drive_id if remote_entry else "")
+            return {
+                "type": "delete_remote",
+                "file_id": file_id,
+                "path": path,
+                "reason": "local_deleted_greater",
+            }
+
+        if isinstance(action, DeleteLocal):
+            return {
+                "type": "delete_local",
+                "path": path,
+                "reason": "remote_deleted_lesser",
+            }
+
+        if isinstance(action, UpdateVectorOnly):
+            # Update state with merged vector, no file transfer
+            if action.merged and local_entry is not None:
+                self._state.update_file(
+                    path,
+                    FileEntry(
+                        mtime=local_entry.mtime,
+                        size=local_entry.size,
+                        drive_id=local_entry.drive_id
+                        or (remote_entry.drive_id if remote_entry else None),
+                        version=action.merged,
+                        md5=local_entry.md5,
+                    ),
                 )
-            # new × (modified|deleted) → n/a
             return None
 
-        # 로컬: 수정됨 ──────────────────────────────────────────────────
-        if local_kind == LOCAL_MODIFIED:
-            if remote_kind == REMOTE_UNCHANGED:
-                return {"type": "upload", "path": path, "reason": "local_modified"}
-            if remote_kind in (REMOTE_MODIFIED, REMOTE_DELETED):
-                return self._conflict_action(
-                    path, new_files.get(path), remote_info
+        if isinstance(action, AbsorbRemoteTombstone):
+            # Record tombstone in local state
+            if action.remote_entry is not None:
+                self._state.update_file(
+                    path,
+                    FileEntry(
+                        mtime=0.0,
+                        size=0,
+                        drive_id=action.remote_entry.drive_id,
+                        version=action.remote_entry.version,
+                        deleted=True,
+                    ),
                 )
-            return None
-
-        # 로컬: 삭제됨 ──────────────────────────────────────────────────
-        if local_kind == LOCAL_DELETED:
-            if remote_kind == REMOTE_UNCHANGED:
-                old_entry = old_files.get(path)
-                if old_entry is None or old_entry.drive_id is None:
-                    return None
-                return {
-                    "type": "delete_remote",
-                    "file_id": old_entry.drive_id,
-                    "path": path,
-                    "reason": "local_deleted",
-                }
-            if remote_kind == REMOTE_MODIFIED:
-                return self._conflict_action(path, old_files.get(path), remote_info)
-            # deleted × (new|deleted) → no-op / n/a
             return None
 
         return None
 
-    def _conflict_action(
-        self,
-        path: str,
-        local_entry: FileEntry | None,
-        remote_info: dict[str, Any],
-    ) -> dict:
-        """충돌 action을 생성한다 (sync_engine에서 conflict_resolver로 위임된다)."""
-        local_payload: dict[str, Any] = {}
-        if local_entry is not None:
-            local_payload = {
-                "mtime": local_entry.mtime,
-                "size": local_entry.size,
-                "drive_id": local_entry.drive_id,
-            }
-        remote_file = remote_info.get("file") or {}
-        remote_payload = {
-            "file_id": remote_info.get("file_id"),
-            "modified_time": remote_file.get("modified_time")
-            or remote_file.get("modifiedTime"),
-            "md5": remote_file.get("md5") or remote_file.get("md5Checksum"),
-            "name": remote_file.get("name"),
-        }
-        return {
-            "type": "conflict",
-            "path": path,
-            "local": local_payload,
-            "remote": remote_payload,
-        }
+
+def _entry_to_info(entry: FileEntry | None) -> dict[str, Any]:
+    """Convert FileEntry to info dict for conflict action."""
+    if entry is None:
+        return {}
+    return {
+        "mtime": entry.mtime,
+        "size": entry.size,
+        "drive_id": entry.drive_id,
+        "md5": entry.md5,
+        "file_id": entry.drive_id,
+    }
 
 
 def _parse_rfc3339(value: str | None) -> float:
-    """RFC3339 문자열을 UNIX epoch 초로 변환한다. 실패 시 0.0."""
+    """RFC3339 string to UNIX epoch seconds. Returns 0.0 on failure."""
     if not value:
         return 0.0
     try:
-        # "2026-04-14T15:30:00.000Z" 또는 "2026-04-14T15:30:00Z"
         normalized = value.replace("Z", "+00:00")
         dt = datetime.fromisoformat(normalized)
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=UTC)
         return dt.timestamp()
     except ValueError:
-        logger.warning(f"RFC3339 파싱 실패: {value}")
+        logger.warning(f"RFC3339 parse failed: {value}")
         return 0.0
