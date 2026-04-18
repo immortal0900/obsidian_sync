@@ -1,5 +1,56 @@
 # Progress Log
 
+## Sprint 3 — Session 1 (2026-04-19)
+
+**Sprint Contract 진행률**: 5/5 P0 + DoD 전체 완료 (100%)
+
+### 완료한 작업
+
+1. **P0-4: conflict.py Syncthing 명명 규칙** (`07a70b5`)
+   - 파일명 포맷 변경: `{stem}.conflict-{device_id}-{ts}.{ext}` → `{stem}.sync-conflict-{ts}-{device_prefix}.{ext}`
+   - device_prefix = device_id[:8] 사용
+   - tests/test_conflict.py 9개 테스트 전부 통과
+
+2. **P0-2 + P0-3: reconciler.py 전면 재작성 + run_without_state 재설계** (`0382915`)
+   - 16셀 classify/decide 매트릭스 제거 → VectorOrdering 기반 `decide()` 구현
+   - `decide_download_or_delete()`, `decide_upload_or_delete()` 보조 함수 구현
+   - `resolve_conflict()` HLC tiebreaker + device prefix fallback 구현
+   - Action 타입 추가: `AbsorbRemoteTombstone`, `UpdateVectorOnly`, `DeleteLocal`, `DeleteRemote` 등
+   - `run_without_state()` md5 기반 5개 분기 구현:
+     - Branch 1: 양쪽 md5 동일 → vector merge, 전송 없음
+     - Branch 2: 로컬 only → upload
+     - Branch 3: 원격 only → download
+     - Branch 4: state 손실 + md5 불일치 → 강제 Conflict (P0 1-B 방어)
+     - Branch 5: tombstone only → state에 deleted=True 흡수
+   - `state.diff()` deprecated 처리
+   - IGNORE_PATTERNS를 run_without_state Drive 목록 및 _classify_remote에도 적용
+   - 기존 test_reconciler.py 20개 → version compare 호환으로 업데이트
+   - 신규 test_reconciler_v2.py 29개 테스트 추가 (decide, resolve_conflict, run_without_state, 증상 3·4)
+
+3. **P0-5: sync_engine md5 통합 + config 필드** (`c251521`)
+   - `_do_upload`: `compute_md5()` → appProperties 및 FileEntry.md5에 기록
+   - `_do_download`: `compute_md5()` → 다운로드 후 로컬 md5 계산하여 저장
+   - `config.py`에 `hash_max_file_size_mb: int = 100`, `hash_verification: bool = True` 추가
+   - Drive 메타데이터만 변경(md5 동일) 시 download skip (UpdateVectorOnly)
+
+### 내린 결정과 이유
+
+- **incremental run()에서 local deleted + no remote change 처리**: local이 삭제되고 remote change가 없을 때, old_files에서 remote entry를 복원하여 decide()에 전달. 이를 통해 DeleteRemote 액션 정상 생성.
+- **conflict.py에서 device_id 전체 대신 prefix(8자) 사용**: Syncthing BEP 명세 준수 + 파일명 길이 최소화.
+- **Google Docs (md5Checksum=None) 대응**: Drive md5가 없어도 local compute_md5()가 채워주므로 FileEntry.md5는 항상 유효. 기존 테스트 업데이트.
+
+### 미처리 이슈
+
+- Sprint 1/2 QA 권고사항(에코 억제 테스트, prefix 충돌 양성 테스트, trash_retention_days config 테스트)은 P1 비차단으로 미구현
+- `_do_conflict`에서 winner 판정 로직은 reconciler의 conflict action에 "winner" 필드로 전달되나, sync_engine이 이를 활용하는 분기는 아직 미구현 (기존 동작: 항상 remote wins + conflict copy)
+
+### 다음 세션에서 해야 할 것
+
+1. **Evaluator 실행**: Sprint 3 QA → PASS 판정
+2. **Sprint 4 착수**: PR4 — Intent Log WAL + Convergence 프로토콜 + 설정 완성
+
+---
+
 ## Sprint 2 — Session 1 (2026-04-19)
 
 **Sprint Contract 진행률**: 5/5 P0 + DoD 전체 완료 (100%)
