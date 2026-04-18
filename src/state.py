@@ -160,6 +160,7 @@ class SyncState:
             for rel_path, file_data in data.get("files", {}).items():
                 self.files[rel_path] = FileEntry.from_dict(file_data)
             self.known_device_ids = set(data.get("known_device_ids", []))
+            self.known_device_ids.add(self.device_id)
 
         # v1에서 마이그레이션된 경우 즉시 v2로 저장
         if file_version == 1:

@@ -291,8 +291,7 @@ def build_context(
     drive = DriveClient(config)
     state = SyncState(config)
     conflict_resolver = ConflictResolver(config.device_id, config.vault_path)
-    trash_dir = config.vault_path / ".sync" / "trash"
-    trash_manager = TrashManager(trash_dir)
+    trash_manager = TrashManager(config.vault_path)
     engine = SyncEngine(drive, state, conflict_resolver, trash_manager=trash_manager)
     reconciler = Reconciler(state, drive)
     watcher = LocalWatcher(
