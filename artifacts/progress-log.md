@@ -1,5 +1,30 @@
 # Progress Log
 
+## Sprint 1 — Session 3 (2026-04-19)
+
+**Sprint Contract 진행률**: 5/5 P0 + DoD 전체 완료 (100%) — QA FAIL 수정 완료
+
+### 완료한 작업
+
+1. **QA FAIL 수정** (`fbdc409`)
+   - `main.py`: TrashManager에 `config.vault_path`를 직접 전달 (이전: `.sync/trash/`를 이미 붙인 경로를 전달하여 이중 중첩)
+   - `state.py`: `load()` 시 현재 `device_id`를 `known_device_ids`에 자동 추가 — prefix 충돌 감지 완전화
+
+### 내린 결정과 이유
+
+- `known_device_ids.add(self.device_id)`를 load() 직후에 배치: 첫 실행이든 기존 state든 자기 자신이 항상 set에 포함되어야 충돌 감지가 의미 있음
+
+### 미처리 이슈
+
+- 통합 테스트 8개 파일 의존성 미설치 (watchdog, googleapiclient) — 환경 문제, 코드 결함 아님
+
+### 다음 세션에서 해야 할 것
+
+1. **Evaluator 재실행**: QA 수정 확인 → PASS 판정
+2. **Sprint 2 착수**: PR2 — Drive appProperties 통합 + Drive Tombstone 폴더
+
+---
+
 ## Sprint 1 — Session 2 (2026-04-19)
 
 **Sprint Contract 진행률**: 5/5 P0 + DoD 전체 완료 (100%)
