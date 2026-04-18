@@ -184,7 +184,8 @@ def test_download_handles_none_md5_gracefully(
     )
 
     entry = state.files["doc.md"]
-    assert entry.md5 is None
+    # Drive md5 is None (Google Docs), but local compute_md5 fills it
+    assert entry.md5 is not None  # local md5 computed
     assert entry.drive_id == "gdoc"
 
 
@@ -283,7 +284,7 @@ def test_conflict_creates_copy_and_downloads_remote(
     assert (vault / "c.md").read_bytes() == b"remote_version"
     # 충돌 사본 하나 생성됨
     conflicts = [
-        p for p in vault.iterdir() if p.name.startswith("c.conflict-")
+        p for p in vault.iterdir() if ".sync-conflict-" in p.name
     ]
     assert len(conflicts) == 1
     # state도 rid로 갱신
