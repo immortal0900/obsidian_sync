@@ -1,5 +1,67 @@
 # Progress Log
 
+## Sprint 4 — Session 1 (2026-04-19)
+
+**Sprint Contract 진행률**: 5/5 P0 + DoD 전체 완료 (100%)
+
+### 완료한 작업
+
+1. **P0-1: intent_log.py 구현** (`d78972f`)
+   - `src/intent_log.py` 신규: JSONL append-only WAL
+   - record(action) → UUID 반환, resolve(intent_id), replay(execute_fn), compact()
+   - os.fsync 기반 내구성 보장
+   - `tests/test_intent_log.py`: 14 tests — record/resolve 왕복, SIGKILL 시뮬레이션, replay 실패 처리, compact 크기 감소, corrupt line 방어
+
+2. **P0-2: convergence.py 구현** (`69b631b`)
+   - `src/convergence.py` 신규: ConvergenceManager + ConvergenceState
+   - report_seen, check_converged, gc_eligible, blacklist_device
+   - optimistic concurrency: exponential backoff + jitter (0.5s~8s, 6회 재시도)
+   - `tests/test_convergence.py`: 16 tests — 단일/2기기 수렴, blacklist, gc_eligible, etag 경합, 재시도 실패
+
+3. **P0-3: sync_engine.py Intent Log 통합** (`f185a37`)
+   - `_run_action` 전 intent_log.record(), 성공 후 resolve()
+   - `replay_intents()` 부트 시 미해결 intent 재실행
+   - intent_log는 optional (기존 테스트 backward compatible)
+   - `tests/test_sync_engine.py`: 4개 신규 테스트 — record/resolve 순서, 실패 시 resolve 미발생, 부트 replay, intent_log 없이 동작
+
+4. **P0-4: main.py wiring + config 완성** (`3aafdde`)
+   - main.py: IntentLog + ConvergenceManager 인스턴스 생성, SyncEngine에 intent_log 주입
+   - run_app: state.load() 후 intent_log.replay() 호출
+   - config.py: `tombstone_retention_days: int = 90` 추가
+   - from_yaml(): `hash_max_file_size_mb`, `hash_verification`, `tombstone_retention_days` YAML 파싱 추가
+   - `tests/test_config.py`: 2개 신규 테스트 — YAML 파싱 + 기본값 검증
+
+5. **P0-5: 누적 QA 권고사항 해소** (`8c7aae0`)
+   - (a) `REMOTE_PSEUDO_DEVICE = "_remote_"` 상수 정의 → 매직 스트링 제거
+   - (b) `decide()`: md5 비교에 `not local.deleted and not remote.deleted` 가드 추가
+   - (c) `run_without_state` non-empty version 분기 3개 테스트 추가 (upload/download/conflict)
+   - (d) `VersionVector.__bool__` 명시: empty → falsy, `reconciler.py` falsy 판정 명시화
+   - `ruff check` 통과
+
+### 최종 테스트 결과
+
+- `pytest tests/`: **454 passed, 2 skipped** (0 failures)
+- `ruff check src/ tests/`: **All checks passed!**
+
+### 내린 결정과 이유
+
+- **IntentLog에서 os.fsync 사용**: JSONL append 후 즉시 fsync하여 SIGKILL 시에도 기록이 손실되지 않도록 보장
+- **ConvergenceManager에 read_fn/write_fn 콜백 패턴**: Drive API 의존성을 역전하여 테스트 가능성 확보. 실제 Drive 연결은 인증 후 wiring
+- **convergence 변수 noqa 처리**: ConvergenceManager는 초기화만 하고 tombstone GC 루프에서 사용 예정. 현재는 인스턴��만 생���
+
+### 미처리 이슈
+
+- ConvergenceManager의 Drive API 콜백 wiring 미완 — 실제 Drive 파일 읽기/쓰기 연결 필요 (tombstone GC 루프 구현 시 처리)
+- 에코 억제 전용 테스트, device_id prefix 충돌 ��성 테스트 — P1 비차단
+- `_do_conflict`에서 winner 필드 활용 분기 미구현 — P1 비차단
+
+### 다음 세션에서 해야 할 것
+
+1. **Evaluator 실행**: Sprint 4 QA → PASS 판정
+2. **프로젝트 완성**: spec.md PR 로드맵 마지막 단계 완료. 이후 통합 테스트 환경에서 수동 검증 권장
+
+---
+
 ## Sprint 3 — Session 1 (2026-04-19)
 
 **Sprint Contract 진행률**: 5/5 P0 + DoD 전체 완료 (100%)
