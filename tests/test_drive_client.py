@@ -237,6 +237,68 @@ class TestTombstones:
         )
 
 
+class TestTombstonesChangeDetection:
+    """Changes API에서 tombstones 폴더로 이동된 파일을 삭제로 감지."""
+
+    def test_change_with_tombstones_parent_detected_as_removed(self, drive_client):
+        """parents가 tombstones 폴더이면 removed=True로 정규화."""
+        drive_client._tombstones_folder_id = "tomb_folder_id"
+        drive_client._vault_folder_ids.add("tomb_folder_id")
+
+        drive_client._service.changes().list.return_value.execute.return_value = {
+            "newStartPageToken": "T2",
+            "changes": [
+                {
+                    "fileId": "f1",
+                    "removed": False,
+                    "file": {
+                        "id": "f1",
+                        "name": "deleted.md",
+                        "mimeType": "text/plain",
+                        "modifiedTime": "2026-04-19T00:00:00Z",
+                        "parents": ["tomb_folder_id"],
+                        "trashed": False,
+                        "size": "10",
+                        "appProperties": {"ot_sync_deleted": "1"},
+                    },
+                },
+            ],
+        }
+
+        changes, _ = drive_client.get_changes("T1")
+        assert len(changes) == 1
+        assert changes[0]["removed"] is True
+        assert changes[0]["file"] is None  # deleted → file payload is None
+
+    def test_tombstones_folder_absence_warning(self, drive_client, caplog):
+        """tombstones 폴더 ID가 None이면 tombstone 감지 안 됨 (정상 파일로 취급)."""
+        drive_client._tombstones_folder_id = None
+        drive_client._vault_folder_ids.add("some_folder")
+
+        drive_client._service.changes().list.return_value.execute.return_value = {
+            "newStartPageToken": "T2",
+            "changes": [
+                {
+                    "fileId": "f1",
+                    "removed": False,
+                    "file": {
+                        "id": "f1",
+                        "name": "still_alive.md",
+                        "mimeType": "text/plain",
+                        "modifiedTime": "2026-04-19T00:00:00Z",
+                        "parents": ["some_folder"],
+                        "trashed": False,
+                        "size": "10",
+                    },
+                },
+            ],
+        }
+
+        changes, _ = drive_client.get_changes("T1")
+        assert len(changes) == 1
+        assert changes[0]["removed"] is False
+
+
 class TestRename:
     """DriveClient.rename 테스트."""
 

@@ -329,6 +329,17 @@ async def run_app(ctx: AppContext) -> int:
         logger.exception("Drive 인증 실패")
         return 1
 
+    # tombstones 폴더 보장 (부트 시 부재 감지 + 자동 재생성)
+    try:
+        tombstones_id = await loop.run_in_executor(
+            None, ctx.drive.ensure_tombstones_folder
+        )
+        logger.info(f".sync/tombstones/ 폴더 확인: {tombstones_id}")
+    except Exception:
+        logger.warning(
+            ".sync/tombstones/ 폴더 확인 실패 — 삭제 동기화가 제한될 수 있음"
+        )
+
     # 상태 로드 — True: run(), False: run_without_state()
     state_loaded = ctx.state.load()
 
