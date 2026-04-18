@@ -48,11 +48,13 @@ class SyncEngine:
         state: SyncState,
         conflict_resolver: ConflictResolver,
         trash_manager: TrashManager | None = None,
+        intent_log: Any | None = None,
     ) -> None:
         self._drive = drive_client
         self._state = state
         self._conflict = conflict_resolver
         self._trash = trash_manager
+        self._intent_log = intent_log
 
         # 잠금: 실행 중 여부
         self.lock: bool = False
@@ -116,6 +118,15 @@ class SyncEngine:
 
     # ── 공개 API ─────────────────────────────────────────────────────────
 
+    def replay_intents(self) -> int:
+        """Boot-time replay of unresolved intents from the WAL.
+
+        Returns the number of intents replayed.
+        """
+        if self._intent_log is None:
+            return 0
+        return self._intent_log.replay(self._run_action)
+
     def execute(self, action: dict) -> None:
         """단일 action을 실행한다.
 
@@ -178,8 +189,17 @@ class SyncEngine:
     # ── 내부 구현 ────────────────────────────────────────────────────────
 
     def _run_action(self, action: dict) -> None:
-        """잠금 보유 상태에서 단일 action을 처리한다."""
+        """잠금 보유 상태에서 단일 action을 처리한다.
+
+        Intent Log WAL: record before execution, resolve on success.
+        """
         action_type = action.get("type")
+
+        # WAL: record intent before execution
+        intent_id: str | None = None
+        if self._intent_log is not None:
+            intent_id = self._intent_log.record(action)
+
         try:
             if action_type == ACTION_UPLOAD:
                 self._do_upload(action)
@@ -195,6 +215,12 @@ class SyncEngine:
                 self._do_conflict(action)
             else:
                 logger.error(f"알 수 없는 action type: {action_type}")
+                return
+
+            # WAL: resolve on success
+            if self._intent_log is not None and intent_id is not None:
+                self._intent_log.resolve(intent_id)
+
         except TokenInvalidError:
             # 토큰 무효화는 상위(reconciler)로 전파
             raise

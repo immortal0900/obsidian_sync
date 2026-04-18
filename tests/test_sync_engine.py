@@ -515,3 +515,82 @@ def test_404_cleanup_without_path_hint(
 
     assert "a.md" not in state.files
     assert "b.md" in state.files
+
+
+# ── Sprint 4: Intent Log integration ──────────────────────────────────
+
+
+def test_intent_log_record_resolve_on_upload(
+    state: SyncState, drive: MagicMock, resolver: ConflictResolver, vault: Path
+) -> None:
+    """Upload action records intent before and resolves after."""
+    from src.intent_log import IntentLog
+
+    log_path = vault / ".sync" / "intent_log.jsonl"
+    intent_log = IntentLog(log_path)
+    engine = SyncEngine(drive, state, resolver, intent_log=intent_log)
+
+    _write(vault, "test.md", b"hello")
+    engine.execute({"type": ACTION_UPLOAD, "path": "test.md"})
+
+    # Should have record + resolve lines
+    lines = [l for l in log_path.read_text("utf-8").strip().split("\n") if l]
+    assert len(lines) == 2
+
+    import json
+
+    record = json.loads(lines[0])
+    assert "action" in record
+    resolve = json.loads(lines[1])
+    assert resolve["resolved"] is True
+
+
+def test_intent_log_no_resolve_on_failure(
+    state: SyncState, drive: MagicMock, resolver: ConflictResolver, vault: Path
+) -> None:
+    """Failed action should NOT have a resolve entry (WAL safety)."""
+    from src.intent_log import IntentLog
+
+    log_path = vault / ".sync" / "intent_log.jsonl"
+    intent_log = IntentLog(log_path)
+    engine = SyncEngine(drive, state, resolver, intent_log=intent_log)
+
+    _write(vault, "fail.md", b"data")
+    drive.upload.side_effect = RuntimeError("network error")
+
+    engine.execute({"type": ACTION_UPLOAD, "path": "fail.md"})
+
+    lines = [l for l in log_path.read_text("utf-8").strip().split("\n") if l]
+    assert len(lines) == 1  # record only, no resolve
+
+
+def test_replay_intents_on_boot(
+    state: SyncState, drive: MagicMock, resolver: ConflictResolver, vault: Path
+) -> None:
+    """Boot-time replay re-executes unresolved intents."""
+    from src.intent_log import IntentLog
+
+    log_path = vault / ".sync" / "intent_log.jsonl"
+
+    # Simulate: previous process recorded an intent but crashed
+    log1 = IntentLog(log_path)
+    _write(vault, "replay.md", b"data")
+    log1.record({"type": ACTION_UPLOAD, "path": "replay.md"})
+    # No resolve — simulating crash
+
+    # New process boots up
+    log2 = IntentLog(log_path)
+    engine = SyncEngine(drive, state, resolver, intent_log=log2)
+    count = engine.replay_intents()
+
+    assert count == 1
+    drive.upload.assert_called_once()
+
+
+def test_engine_without_intent_log_works(
+    engine: SyncEngine, drive: MagicMock, vault: Path
+) -> None:
+    """Engine without intent_log should work normally (backward compat)."""
+    _write(vault, "test.md", b"ok")
+    engine.execute({"type": ACTION_UPLOAD, "path": "test.md"})
+    drive.upload.assert_called_once()
