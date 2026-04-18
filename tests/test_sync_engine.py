@@ -138,7 +138,7 @@ def test_download_writes_state_entry(
 # ── delete ──────────────────────────────────────────────────────────────
 
 
-def test_delete_remote_removes_state_entry(
+def test_delete_remote_marks_deleted_in_state(
     engine: SyncEngine, state: SyncState, drive: MagicMock
 ) -> None:
     state.files["note.md"] = FileEntry(mtime=1.0, size=1, drive_id="did")
@@ -146,25 +146,32 @@ def test_delete_remote_removes_state_entry(
         {"type": ACTION_DELETE_REMOTE, "file_id": "did", "path": "note.md"}
     )
     drive.delete.assert_called_once_with("did")
-    assert "note.md" not in state.files
+    # v2: deleted=True + version 갱신으로 tombstone 기록
+    assert "note.md" in state.files
+    assert state.files["note.md"].deleted is True
+    assert state.files["note.md"].version.counters  # version이 갱신됨
 
 
-def test_delete_local_removes_file_and_entry(
+def test_delete_local_removes_file_and_marks_deleted(
     engine: SyncEngine, state: SyncState, vault: Path
 ) -> None:
     p = _write(vault, "note.md", b"x")
     state.files["note.md"] = FileEntry(mtime=1.0, size=1, drive_id="did")
     engine.execute({"type": ACTION_DELETE_LOCAL, "path": "note.md"})
     assert not p.exists()
-    assert "note.md" not in state.files
+    # v2: deleted=True + version 갱신으로 tombstone 기록
+    assert "note.md" in state.files
+    assert state.files["note.md"].deleted is True
 
 
-def test_delete_local_missing_file_still_removes_entry(
+def test_delete_local_missing_file_still_marks_deleted(
     engine: SyncEngine, state: SyncState
 ) -> None:
     state.files["ghost.md"] = FileEntry(mtime=1.0, size=1, drive_id="did")
     engine.execute({"type": ACTION_DELETE_LOCAL, "path": "ghost.md"})
-    assert "ghost.md" not in state.files
+    # v2: deleted=True로 마킹 (tombstone)
+    assert "ghost.md" in state.files
+    assert state.files["ghost.md"].deleted is True
 
 
 # ── rename ──────────────────────────────────────────────────────────────
@@ -321,7 +328,9 @@ def test_remote_removed_known_file_triggers_delete_local(
     )
 
     assert not (vault / "x.md").exists()
-    assert "x.md" not in state.files
+    # v2: deleted=True로 tombstone 기록
+    assert "x.md" in state.files
+    assert state.files["x.md"].deleted is True
 
 
 def test_remote_removed_unknown_file_ignored(

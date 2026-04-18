@@ -119,7 +119,12 @@ class LocalWatcher(FileSystemEventHandler):
             logger.exception(f"삭제 이벤트 전파 실패: {rel}")
 
     def on_moved(self, event: Any) -> None:
-        """이동은 rename_remote 액션으로 위임한다 (디바운스 적용)."""
+        """이동을 delete+create로 분해한다.
+
+        spec.md v2 P1 2-C 확정: on_moved를 delete(old_path) + create(new_path)로
+        분해하여 version vector 증분을 정확하게 처리한다.
+        old path에는 deleted=True + update(dev), new path에는 empty.update(dev).
+        """
         if getattr(event, "is_directory", False):
             return
 
@@ -132,7 +137,22 @@ class LocalWatcher(FileSystemEventHandler):
             return
 
         self._mark_event()
-        self._schedule_move(src_rel, dest_rel)
+
+        # delete old path (즉시, 디바운스 없음)
+        if not self._should_ignore(src_rel):
+            # 같은 경로에 대기 중인 디바운스가 있으면 취소
+            with self._timers_lock:
+                pending = self._timers.pop(src_rel, None)
+                if pending is not None:
+                    pending.cancel()
+            try:
+                self._sync_engine.handle_local_change("deleted", src_rel)
+            except Exception:
+                logger.exception(f"이동(삭제) 이벤트 전파 실패: {src_rel}")
+
+        # create new path (디바운스 적용)
+        if not self._should_ignore(dest_rel):
+            self._enqueue_with_debounce_for_path(dest_rel, "created")
 
     # ── 디바운스 관리 ────────────────────────────────────────────────────
 
@@ -146,19 +166,24 @@ class LocalWatcher(FileSystemEventHandler):
             return
 
         self._mark_event()
+        self._enqueue_with_debounce_for_path(rel, event_type)
 
+    def _enqueue_with_debounce_for_path(
+        self, rel_path: str, event_type: str
+    ) -> None:
+        """상대 경로 기반 디바운스 타이머를 (재)설정한다."""
         with self._timers_lock:
-            existing = self._timers.get(rel)
+            existing = self._timers.get(rel_path)
             if existing is not None:
                 existing.cancel()
 
             timer = threading.Timer(
                 self._debounce_seconds,
                 self._fire_change,
-                args=(rel, event_type),
+                args=(rel_path, event_type),
             )
             timer.daemon = True
-            self._timers[rel] = timer
+            self._timers[rel_path] = timer
             timer.start()
 
     def _fire_change(self, rel_path: str, event_type: str) -> None:

@@ -17,6 +17,8 @@ from src.config import should_ignore
 from src.conflict import ConflictResolver
 from src.drive_client import DriveClient, DriveFileNotFoundError, TokenInvalidError
 from src.state import FileEntry, SyncState
+from src.trash import TrashManager
+from src.version_vector import VersionVector
 
 logger = logging.getLogger(__name__)
 
@@ -45,10 +47,12 @@ class SyncEngine:
         drive_client: DriveClient,
         state: SyncState,
         conflict_resolver: ConflictResolver,
+        trash_manager: TrashManager | None = None,
     ) -> None:
         self._drive = drive_client
         self._state = state
         self._conflict = conflict_resolver
+        self._trash = trash_manager
 
         # 잠금: 실행 중 여부
         self.lock: bool = False
@@ -233,13 +237,20 @@ class SyncEngine:
 
         existing = self._state.files.get(path)
         existing_id = existing.drive_id if existing else None
+        old_version = existing.version if existing else VersionVector.empty()
 
         drive_id = self._drive.upload(local_abs, path, existing_id=existing_id)
 
         stat = local_abs.stat()
+        new_version = old_version.update(self._state.device_id)
         self._state.update_file(
             path,
-            FileEntry(mtime=stat.st_mtime, size=stat.st_size, drive_id=drive_id),
+            FileEntry(
+                mtime=stat.st_mtime,
+                size=stat.st_size,
+                drive_id=drive_id,
+                version=new_version,
+            ),
         )
         self._mark_drive_written(drive_id)
         logger.info(f"동기화 완료 (upload): {path}")
@@ -253,9 +264,18 @@ class SyncEngine:
         self._drive.download(file_id, local_abs)
 
         stat = local_abs.stat()
+        # PR2에서 원격 vector를 반영할 예정. 현재는 로컬 version 갱신.
+        existing = self._state.files.get(path)
+        old_version = existing.version if existing else VersionVector.empty()
+        new_version = old_version.update(self._state.device_id)
         self._state.update_file(
             path,
-            FileEntry(mtime=stat.st_mtime, size=stat.st_size, drive_id=file_id),
+            FileEntry(
+                mtime=stat.st_mtime,
+                size=stat.st_size,
+                drive_id=file_id,
+                version=new_version,
+            ),
         )
         logger.info(f"동기화 완료 (download): {path}")
 
@@ -266,7 +286,20 @@ class SyncEngine:
         self._drive.delete(file_id)
 
         if path is not None:
-            self._state.remove_file(path)
+            existing = self._state.files.get(path)
+            old_version = existing.version if existing else VersionVector.empty()
+            new_version = old_version.update(self._state.device_id)
+            self._state.update_file(
+                path,
+                FileEntry(
+                    mtime=existing.mtime if existing else 0.0,
+                    size=existing.size if existing else 0,
+                    drive_id=file_id,
+                    version=new_version,
+                    deleted=True,
+                    deleted_at=time.time(),
+                ),
+            )
         logger.info(f"동기화 완료 (delete_remote): {path or file_id}")
 
     def _do_delete_local(self, action: dict) -> None:
@@ -275,13 +308,40 @@ class SyncEngine:
 
         self._mark_local_written(path)
         if local_abs.exists():
-            try:
-                local_abs.unlink()
-            except OSError:
-                logger.exception(f"로컬 파일 삭제 실패: {path}")
-                return
+            if self._trash is not None:
+                try:
+                    existing = self._state.files.get(path)
+                    md5 = existing.md5 if existing else None
+                    self._trash.move(local_abs, path, md5=md5)
+                except Exception:
+                    logger.exception(f"trash 이동 실패, 직접 삭제 시도: {path}")
+                    try:
+                        local_abs.unlink()
+                    except OSError:
+                        logger.exception(f"로컬 파일 삭제 실패: {path}")
+                        return
+            else:
+                try:
+                    local_abs.unlink()
+                except OSError:
+                    logger.exception(f"로컬 파일 삭제 실패: {path}")
+                    return
 
-        self._state.remove_file(path)
+        # version 갱신 + deleted 마킹
+        existing = self._state.files.get(path)
+        old_version = existing.version if existing else VersionVector.empty()
+        new_version = old_version.update(self._state.device_id)
+        self._state.update_file(
+            path,
+            FileEntry(
+                mtime=existing.mtime if existing else 0.0,
+                size=existing.size if existing else 0,
+                drive_id=existing.drive_id if existing else None,
+                version=new_version,
+                deleted=True,
+                deleted_at=time.time(),
+            ),
+        )
         logger.info(f"동기화 완료 (delete_local): {path}")
 
     def _do_rename_remote(self, action: dict) -> None:
