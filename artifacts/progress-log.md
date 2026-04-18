@@ -1,5 +1,33 @@
 # Progress Log
 
+## Sprint 1 — Session 2 (2026-04-19)
+
+**Sprint Contract 진행률**: 5/5 P0 + DoD 전체 완료 (100%)
+
+### 완료한 작업
+
+1. **QA FAIL 5건 전체 수정** (`0dd4d85`)
+   - `_check_device_prefix_collision` 로직 수정: `known_device_ids` set을 state에 추가하여 전체 device_id 기반 prefix 충돌 감지. VV counters의 prefix-only 한계 해소.
+   - `TestMoved` 3개 테스트를 delete+create 분해에 맞게 재작성 (spec v2 P1 2-C 정합)
+   - Dead code 제거: `_schedule_move`, `_fire_move`, `_MOVED_KEY_PREFIX` (38줄 삭제)
+   - `main.py`에 TrashManager wiring: `build_context()`에서 TrashManager 인스턴스 생성 → SyncEngine 주입
+   - `ruff check` 통과 확인 → DoD 체크박스 완료
+
+### 내린 결정과 이유
+
+- **known_device_ids를 state JSON에 추가**: VV counters에는 8자 prefix만 저장되므로 collision 감지가 원천적으로 불가능했음. 전체 device_id를 별도 추적하여 해결. PR2에서 원격 vector 수신 시 자동으로 채워질 예정.
+
+### 미처리 이슈
+
+- watchdog/googleapiclient 미설치 환경이므로 test_local_watcher.py, test_sync_engine.py 등 8개 통합 테스트 파일은 실행 불가. 전체 환경에서 검증 필요.
+
+### 다음 세션에서 해야 할 것
+
+1. **Evaluator 재실행**: QA 수정 확인 → PASS 판정
+2. **Sprint 2 착수**: PR2 — Drive appProperties 통합 + Drive Tombstone 폴더
+
+---
+
 ## Sprint 1 — Session 1 (2026-04-19)
 
 **Sprint Contract 진행률**: 5/5 P0 완료 (100%)
