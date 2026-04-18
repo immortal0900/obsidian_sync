@@ -607,7 +607,7 @@ class TestRunCli:
             raise KeyboardInterrupt
 
         monkeypatch.setattr(main_mod.asyncio, "run", _raise)
-        assert main_mod.run() == 0
+        assert main_mod.run([]) == 0
 
     def test_run_returns_async_exit_code(
         self, monkeypatch: pytest.MonkeyPatch
@@ -619,7 +619,53 @@ class TestRunCli:
             return 42
 
         monkeypatch.setattr(main_mod.asyncio, "run", _close_and_return)
-        assert main_mod.run() == 42
+        assert main_mod.run([]) == 42
+
+    def test_run_accepts_config_argument(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """--config 인자가 main()에 config_path로 전달되는지 검증."""
+        from src import main as main_mod
+
+        captured: dict[str, Any] = {}
+
+        async def _fake_main(config_path: Any) -> int:
+            captured["config_path"] = config_path
+            return 0
+
+        def _run(coro: Any) -> int:
+            try:
+                return coro.send(None)
+            except StopIteration as e:
+                return e.value
+
+        monkeypatch.setattr(main_mod, "main", _fake_main)
+        monkeypatch.setattr(main_mod.asyncio, "run", _run)
+        assert main_mod.run(["--config", "work.yaml"]) == 0
+        assert captured["config_path"] == "work.yaml"
+
+    def test_run_short_flag_c(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """-c 축약형도 동작하는지 검증."""
+        from src import main as main_mod
+
+        captured: dict[str, Any] = {}
+
+        async def _fake_main(config_path: Any) -> int:
+            captured["config_path"] = config_path
+            return 0
+
+        def _run(coro: Any) -> int:
+            try:
+                return coro.send(None)
+            except StopIteration as e:
+                return e.value
+
+        monkeypatch.setattr(main_mod, "main", _fake_main)
+        monkeypatch.setattr(main_mod.asyncio, "run", _run)
+        assert main_mod.run(["-c", "personal.yaml"]) == 0
+        assert captured["config_path"] == "personal.yaml"
 
 
 # ── signal fallback ─────────────────────────────────────────────────────

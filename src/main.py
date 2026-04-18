@@ -402,10 +402,28 @@ async def main(config_path: str | Path = "config.yaml") -> int:
     return await run_app(ctx)
 
 
-def run() -> int:
-    """CLI 엔트리 — asyncio.run 래퍼."""
+def run(argv: list[str] | None = None) -> int:
+    """CLI 엔트리 — asyncio.run 래퍼.
+
+    `--config PATH` 인자로 설정 파일을 지정할 수 있다 (기본: config.yaml).
+    동일 프로젝트 폴더에서 여러 볼트를 운영할 때 쓴다.
+    """
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        prog="obsidian-sync",
+        description="Obsidian ↔ Google Drive 양방향 동기화 데몬",
+    )
+    parser.add_argument(
+        "--config",
+        "-c",
+        default="config.yaml",
+        help="설정 파일 경로 (기본: config.yaml)",
+    )
+    args = parser.parse_args(argv)
+
     try:
-        return asyncio.run(main())
+        return asyncio.run(main(args.config))
     except KeyboardInterrupt:
         logger.info("KeyboardInterrupt — 종료")
         return 0
