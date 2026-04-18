@@ -64,6 +64,12 @@ POLL_BACKOFF_FACTOR: float = 1.5  # 변경 없으면 간격 1.5배
 
 STATE_SAVE_DEBOUNCE_SECONDS: float = 5.0
 
+# ── 상태 파일 스키마 버전 ────────────────────────────────────────────────
+STATE_VERSION: int = 2
+
+# ── 로컬 Trash 보존 기간 ────────────────────────────────────────────────
+DEFAULT_TRASH_RETENTION_DAYS: int = 30
+
 
 @dataclass
 class SyncConfig:
@@ -76,6 +82,7 @@ class SyncConfig:
     token_file: Path
     debounce_seconds: float = 2.0
     delete_local: bool = False
+    trash_retention_days: int = DEFAULT_TRASH_RETENTION_DAYS
     log_level: str = "INFO"
     log_file: str = "obsidian_sync.log"
     log_max_bytes: int = 5 * 1024 * 1024
@@ -121,6 +128,9 @@ class SyncConfig:
         sync_cfg = raw.get("sync", {})
         debounce_seconds = float(sync_cfg.get("debounce_seconds", 2.0))
         delete_local = bool(sync_cfg.get("delete_local", False))
+        trash_retention_days = int(
+            sync_cfg.get("trash_retention_days", DEFAULT_TRASH_RETENTION_DAYS)
+        )
 
         # logging 섹션
         log_cfg = raw.get("logging", {})
@@ -149,6 +159,7 @@ class SyncConfig:
             token_file=token_file,
             debounce_seconds=debounce_seconds,
             delete_local=delete_local,
+            trash_retention_days=trash_retention_days,
             log_level=log_level,
             log_file=log_file,
             log_max_bytes=log_max_bytes,

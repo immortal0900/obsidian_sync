@@ -166,6 +166,9 @@ class SyncState:
                 f"v1 → v2 마이그레이션 완료: 파일 {len(self.files)}개"
             )
 
+        # device_id prefix(8자) 충돌 감지
+        self._check_device_prefix_collision()
+
         logger.info(
             f"상태 파일 로드 완료: 파일 {len(self.files)}개, "
             f"page_token={self.page_token}"
@@ -180,6 +183,19 @@ class SyncState:
             logger.info(f"상태 파일을 백업했습니다: {backup_path}")
         except OSError:
             logger.exception("상태 파일 백업 실패")
+
+    def _check_device_prefix_collision(self) -> None:
+        """기존 state의 version vector에 동일 prefix가 다른 device에서 사용되는지 검사."""
+        my_prefix = self.device_id[:8]
+        for rel_path, entry in self.files.items():
+            for dev_prefix in entry.version.counters:
+                if dev_prefix == my_prefix and dev_prefix != self.device_id[:8]:
+                    logger.warning(
+                        f"device_id prefix 충돌 감지: "
+                        f"내 prefix={my_prefix}, 파일={rel_path}의 "
+                        f"vector에 동일 prefix가 다른 기기에서 사용됨"
+                    )
+                    return  # 한 번만 경고
 
     def _backup_v1_state(self) -> None:
         """v1→v2 마이그레이션 전 v1 백업을 생성한다 (다운그레이드 안전망)."""
