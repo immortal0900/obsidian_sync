@@ -29,10 +29,15 @@ IGNORE_PATTERNS: list[str] = [
     ".obsidian/",          # Obsidian 설정 전체 (workspace.json 포함)
     ".sync/",              # 이 프로그램의 상태 파일
     ".trash/",             # Obsidian 휴지통
-    ".smart-env/",         # Smart Connections 플러그인
+    ".smart-env/",         # Smart Connections 플러그인 폴더
+    ".smart-connections/", # Smart Connections 구버전
+    ".makemd/",            # MakeMD 플러그인
     ".git/",               # Git 메타데이터
     ".DS_Store",           # macOS Finder
     "Thumbs.db",           # Windows Explorer
+    "*.ajson",             # Smart Connections 임베딩 캐시 (루트/중첩 포함)
+    "*.smtcmp_*",          # Smart Connections 압축 캐시
+    ".smtcmp_*",           # Smart Connections 숨김 캐시
     "*.tmp",               # 임시 파일
     "*.swp",               # Vim swap
 ]
@@ -175,9 +180,10 @@ def should_ignore(rel_path: str) -> bool:
             if dir_name in parts:
                 return True
         elif "*" in pattern:
-            # 글로브 패턴: 파일명 매칭
-            if fnmatch.fnmatch(filename, pattern):
-                return True
+            # 글로브 패턴: 파일명 또는 경로 상의 어떤 구성요소와도 매칭
+            for part in parts:
+                if fnmatch.fnmatch(part, pattern):
+                    return True
         else:
             # 정확한 매칭: 파일명 또는 전체 경로
             if filename == pattern or normalized == pattern:

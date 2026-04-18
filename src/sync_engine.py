@@ -8,10 +8,12 @@ from __future__ import annotations
 
 import logging
 import threading
+import time
 from collections import deque
 from pathlib import Path
 from typing import Any
 
+from src.config import should_ignore
 from src.conflict import ConflictResolver
 from src.drive_client import DriveClient, DriveFileNotFoundError, TokenInvalidError
 from src.state import FileEntry, SyncState
@@ -25,6 +27,9 @@ ACTION_DELETE_REMOTE = "delete_remote"
 ACTION_DELETE_LOCAL = "delete_local"
 ACTION_RENAME_REMOTE = "rename_remote"
 ACTION_CONFLICT = "conflict"
+
+# 에코 억제 윈도우 — 우리가 방금 쓴 로컬 경로 / 업로드한 drive_id는 이 시간 동안 무시
+ECHO_SUPPRESS_WINDOW_SECONDS = 15.0
 
 
 class SyncEngine:
@@ -52,6 +57,10 @@ class SyncEngine:
         # 잠금 보유 중 들어온 execute 호출을 쌓아두는 큐
         self._pending: deque[dict] = deque()
 
+        # 에코 억제 — (path → 만료 monotonic), (drive_id → 만료 monotonic)
+        self._recent_local_writes: dict[str, float] = {}
+        self._recent_drive_writes: dict[str, float] = {}
+
     # ── 잠금 관리 ────────────────────────────────────────────────────────
 
     def _acquire_lock(self) -> bool:
@@ -66,6 +75,40 @@ class SyncEngine:
         """잠금을 해제한다."""
         with self._lock_guard:
             self.lock = False
+
+    # ── 에코 억제 ────────────────────────────────────────────────────────
+
+    def _mark_local_written(self, path: str) -> None:
+        """우리가 방금 이 로컬 경로를 썼음을 기록 (watcher echo 방지)."""
+        self._recent_local_writes[path] = (
+            time.monotonic() + ECHO_SUPPRESS_WINDOW_SECONDS
+        )
+
+    def _mark_drive_written(self, drive_id: str) -> None:
+        """우리가 방금 이 drive_id를 업로드했음을 기록 (poller echo 방지)."""
+        self._recent_drive_writes[drive_id] = (
+            time.monotonic() + ECHO_SUPPRESS_WINDOW_SECONDS
+        )
+
+    def _is_echo_local(self, path: str) -> bool:
+        """방금 우리가 쓴 경로의 watcher 이벤트인지 확인."""
+        deadline = self._recent_local_writes.get(path)
+        if deadline is None:
+            return False
+        if time.monotonic() >= deadline:
+            self._recent_local_writes.pop(path, None)
+            return False
+        return True
+
+    def _is_echo_drive(self, drive_id: str) -> bool:
+        """방금 우리가 업로드한 drive_id의 poller 이벤트인지 확인."""
+        deadline = self._recent_drive_writes.get(drive_id)
+        if deadline is None:
+            return False
+        if time.monotonic() >= deadline:
+            self._recent_drive_writes.pop(drive_id, None)
+            return False
+        return True
 
     # ── 공개 API ─────────────────────────────────────────────────────────
 
@@ -94,6 +137,10 @@ class SyncEngine:
 
         event_type: "created" | "modified" | "deleted"
         """
+        if self._is_echo_local(path):
+            logger.debug(f"echo 억제 (local_write): {path}")
+            return
+
         if event_type in {"created", "modified"}:
             action = {"type": ACTION_UPLOAD, "path": path, "reason": f"local_{event_type}"}
         elif event_type == "deleted":
@@ -194,6 +241,7 @@ class SyncEngine:
             path,
             FileEntry(mtime=stat.st_mtime, size=stat.st_size, drive_id=drive_id),
         )
+        self._mark_drive_written(drive_id)
         logger.info(f"동기화 완료 (upload): {path}")
 
     def _do_download(self, action: dict) -> None:
@@ -201,6 +249,7 @@ class SyncEngine:
         path: str = action["path"]
         local_abs: Path = self._state.vault_path / path
 
+        self._mark_local_written(path)
         self._drive.download(file_id, local_abs)
 
         stat = local_abs.stat()
@@ -224,6 +273,7 @@ class SyncEngine:
         path: str = action["path"]
         local_abs: Path = self._state.vault_path / path
 
+        self._mark_local_written(path)
         if local_abs.exists():
             try:
                 local_abs.unlink()
@@ -278,6 +328,10 @@ class SyncEngine:
         removed: bool = change.get("removed", False)
         file_meta: dict[str, Any] | None = change.get("file")
 
+        if self._is_echo_drive(file_id):
+            logger.debug(f"echo 억제 (drive_write): {file_id}")
+            return None
+
         # drive_id → 기존 경로 역매핑
         existing_path = self._find_path_by_drive_id(file_id)
 
@@ -300,6 +354,8 @@ class SyncEngine:
             return None
 
         if existing_path is not None:
+            if should_ignore(existing_path):
+                return None
             # 이미 알고 있는 파일 → 재다운로드
             return {
                 "type": ACTION_DOWNLOAD,
@@ -307,6 +363,9 @@ class SyncEngine:
                 "path": existing_path,
                 "reason": "remote_modified",
             }
+
+        if should_ignore(name):
+            return None
 
         # 새 파일 → 루트 폴더 기준 이름으로 다운로드 (중첩 폴더는 reconciler에서 처리)
         return {

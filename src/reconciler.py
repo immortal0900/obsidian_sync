@@ -12,6 +12,7 @@ import logging
 from datetime import UTC, datetime
 from typing import Any
 
+from src.config import should_ignore
 from src.drive_client import DriveClient
 from src.state import FileEntry, SyncState
 
@@ -76,9 +77,12 @@ class Reconciler:
         매칭은 볼트 기준 상대 경로(POSIX)로 수행한다.
         """
         remote_files = self._drive.list_all_files()
-        # remote_files의 각 항목에는 drive_client가 부여한 relative_path 있음
+        # remote_files의 각 항목에는 drive_client가 부여한 relative_path 있음.
+        # IGNORE_PATTERNS에 해당하는 원격 파일은 로컬로 내려받지 않는다.
         remote_by_path: dict[str, dict[str, Any]] = {
-            item["relative_path"]: item for item in remote_files
+            item["relative_path"]: item
+            for item in remote_files
+            if not should_ignore(item["relative_path"])
         }
         local_files = self._state.scan_local_files()
 
@@ -199,6 +203,8 @@ class Reconciler:
                 continue
 
             if known_path is not None:
+                if should_ignore(known_path):
+                    continue
                 remote_kinds[known_path] = {
                     "kind": REMOTE_MODIFIED,
                     "file_id": file_id,
@@ -207,6 +213,8 @@ class Reconciler:
             else:
                 name = file_meta.get("name")
                 if not name:
+                    continue
+                if should_ignore(name):
                     continue
                 remote_kinds[name] = {
                     "kind": REMOTE_NEW,
