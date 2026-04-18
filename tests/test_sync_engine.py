@@ -145,7 +145,9 @@ def test_delete_remote_marks_deleted_in_state(
     engine.execute(
         {"type": ACTION_DELETE_REMOTE, "file_id": "did", "path": "note.md"}
     )
-    drive.hard_delete.assert_called_once_with("did")
+    drive.move_to_tombstones.assert_called_once()
+    call_args = drive.move_to_tombstones.call_args
+    assert call_args[0][0] == "did"  # file_id
     # v2: deleted=True + version 갱신으로 tombstone 기록
     assert "note.md" in state.files
     assert state.files["note.md"].deleted is True
@@ -296,14 +298,14 @@ def test_handle_local_change_deleted_uses_state_drive_id(
 ) -> None:
     state.files["x.md"] = FileEntry(mtime=1.0, size=1, drive_id="did")
     engine.handle_local_change("deleted", "x.md")
-    drive.hard_delete.assert_called_once_with("did")
+    drive.move_to_tombstones.assert_called_once()
 
 
 def test_handle_local_change_deleted_unknown_file_noop(
     engine: SyncEngine, drive: MagicMock
 ) -> None:
     engine.handle_local_change("deleted", "unknown.md")
-    drive.hard_delete.assert_not_called()
+    drive.move_to_tombstones.assert_not_called()
 
 
 def test_handle_local_change_unsupported_event(
@@ -311,7 +313,7 @@ def test_handle_local_change_unsupported_event(
 ) -> None:
     engine.handle_local_change("weird_event", "x.md")
     drive.upload.assert_not_called()
-    drive.hard_delete.assert_not_called()
+    drive.move_to_tombstones.assert_not_called()
 
 
 # ── handle_remote_changes ───────────────────────────────────────────────
@@ -398,9 +400,9 @@ def test_unknown_action_type_is_logged(
 def test_delete_remote_404_removes_state_entry(
     engine: SyncEngine, state: SyncState, drive: MagicMock, vault: Path
 ) -> None:
-    """delete가 404를 받으면 sync_engine이 state에서 해당 drive_id를 제거한다."""
+    """delete_remote가 404를 받으면 sync_engine이 state에서 해당 drive_id를 제거한다."""
     state.files["note.md"] = FileEntry(mtime=1.0, size=1, drive_id="missing")
-    drive.hard_delete.side_effect = DriveFileNotFoundError("missing")
+    drive.move_to_tombstones.side_effect = DriveFileNotFoundError("missing")
 
     engine.execute(
         {

@@ -53,18 +53,27 @@ def drive() -> MagicMock:
     m = MagicMock()
     counter = {"n": 0}
 
-    def _upload(local: Path, rel: str, existing_id: str | None = None) -> str:
+    def _upload(
+        local: Path,
+        rel: str,
+        existing_id: str | None = None,
+        *,
+        app_properties: dict | None = None,
+    ) -> dict:
         counter["n"] += 1
-        return existing_id or f"drive_id_{counter['n']}"
+        fid = existing_id or f"drive_id_{counter['n']}"
+        return {"id": fid, "md5Checksum": None, "appProperties": app_properties or {}}
 
     m.upload.side_effect = _upload
 
-    def _download(file_id: str, local_path: Path) -> None:
+    def _download(file_id: str, local_path: Path) -> dict:
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_bytes(b"remote content")
+        return {"id": file_id, "md5Checksum": None, "appProperties": {}}
 
     m.download.side_effect = _download
-    m.delete = MagicMock()
+    m.hard_delete = MagicMock()
+    m.move_to_tombstones = MagicMock()
     m.rename = MagicMock()
     return m
 

@@ -229,6 +229,8 @@ class SyncEngine:
             )
 
     def _do_upload(self, action: dict) -> None:
+        from src.drive_vv_codec import encode as vv_encode
+
         path: str = action["path"]
         local_abs = self._state.vault_path / path
         if not local_abs.exists():
@@ -238,12 +240,20 @@ class SyncEngine:
         existing = self._state.files.get(path)
         existing_id = existing.drive_id if existing else None
         old_version = existing.version if existing else VersionVector.empty()
+        new_version = old_version.update(self._state.device_id)
 
-        result = self._drive.upload(local_abs, path, existing_id=existing_id)
+        # appProperties에 version vector 인코딩
+        app_props = vv_encode(new_version, deleted=False, md5=existing.md5 if existing else None)
+
+        result = self._drive.upload(
+            local_abs, path, existing_id=existing_id, app_properties=app_props
+        )
         drive_id = result["id"] if isinstance(result, dict) else result
 
+        # Drive API가 반환한 md5Checksum 저장
+        drive_md5 = result.get("md5Checksum") if isinstance(result, dict) else None
+
         stat = local_abs.stat()
-        new_version = old_version.update(self._state.device_id)
         self._state.update_file(
             path,
             FileEntry(
@@ -251,24 +261,39 @@ class SyncEngine:
                 size=stat.st_size,
                 drive_id=drive_id,
                 version=new_version,
+                md5=drive_md5,
             ),
         )
         self._mark_drive_written(drive_id)
         logger.info(f"동기화 완료 (upload): {path}")
 
     def _do_download(self, action: dict) -> None:
+        from src.drive_vv_codec import decode as vv_decode
+
         file_id: str = action["file_id"]
         path: str = action["path"]
         local_abs: Path = self._state.vault_path / path
 
         self._mark_local_written(path)
-        self._drive.download(file_id, local_abs)
+        meta = self._drive.download(file_id, local_abs)
 
         stat = local_abs.stat()
-        # PR2에서 원격 vector를 반영할 예정. 현재는 로컬 version 갱신.
-        existing = self._state.files.get(path)
-        old_version = existing.version if existing else VersionVector.empty()
-        new_version = old_version.update(self._state.device_id)
+
+        # 원격 vector를 반영: appProperties에서 디코딩
+        app_props = meta.get("appProperties") if isinstance(meta, dict) else None
+        remote_vv, _deleted, remote_md5 = vv_decode(app_props)
+
+        # 원격 vector가 있으면 그대로 사용, 없으면 로컬 갱신 (legacy 파일 대응)
+        if remote_vv:
+            new_version = remote_vv
+        else:
+            existing = self._state.files.get(path)
+            old_version = existing.version if existing else VersionVector.empty()
+            new_version = old_version.update(self._state.device_id)
+
+        # Drive API md5Checksum 저장
+        drive_md5 = meta.get("md5Checksum") if isinstance(meta, dict) else None
+
         self._state.update_file(
             path,
             FileEntry(
@@ -276,20 +301,26 @@ class SyncEngine:
                 size=stat.st_size,
                 drive_id=file_id,
                 version=new_version,
+                md5=drive_md5 or remote_md5,
             ),
         )
         logger.info(f"동기화 완료 (download): {path}")
 
     def _do_delete_remote(self, action: dict) -> None:
+        from src.drive_vv_codec import encode as vv_encode
+
         file_id: str = action["file_id"]
         path: str | None = action.get("path")
-
-        self._drive.hard_delete(file_id)
 
         if path is not None:
             existing = self._state.files.get(path)
             old_version = existing.version if existing else VersionVector.empty()
             new_version = old_version.update(self._state.device_id)
+
+            # tombstone move + appProperties 갱신
+            app_props = vv_encode(new_version, deleted=True)
+            self._drive.move_to_tombstones(file_id, app_properties=app_props)
+
             self._state.update_file(
                 path,
                 FileEntry(
@@ -301,6 +332,9 @@ class SyncEngine:
                     deleted_at=time.time(),
                 ),
             )
+        else:
+            # path 없는 경우 fallback: hard_delete
+            self._drive.hard_delete(file_id)
         logger.info(f"동기화 완료 (delete_remote): {path or file_id}")
 
     def _do_delete_local(self, action: dict) -> None:
