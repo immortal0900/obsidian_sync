@@ -53,7 +53,7 @@ def state(config: SyncConfig) -> SyncState:
 @pytest.fixture
 def drive() -> MagicMock:
     mock = MagicMock()
-    mock.upload.return_value = {"id": "drive_id_new", "md5Checksum": None}
+    mock.upload.return_value = {"id": "drive_id_new", "md5Checksum": "drive_md5_hash"}
     return mock
 
 
@@ -89,6 +89,7 @@ def test_upload_creates_file_entry(
     assert "daily/note.md" in state.files
     assert state.files["daily/note.md"].drive_id == "drive_id_new"
     assert state.files["daily/note.md"].size == len(b"content")
+    assert state.files["daily/note.md"].md5 == "drive_md5_hash"
 
 
 def test_upload_updates_existing_drive_id(
@@ -97,7 +98,7 @@ def test_upload_updates_existing_drive_id(
     """기존 drive_id가 있으면 update 경로로 재사용한다."""
     _write(vault, "note.md", b"v2")
     state.files["note.md"] = FileEntry(mtime=1.0, size=1, drive_id="existing_id")
-    drive.upload.return_value = "existing_id"
+    drive.upload.return_value = {"id": "existing_id", "md5Checksum": "updated_md5"}
 
     engine.execute({"type": ACTION_UPLOAD, "path": "note.md"})
 
@@ -120,9 +121,10 @@ def test_upload_missing_file_is_noop(
 def test_download_writes_state_entry(
     engine: SyncEngine, state: SyncState, drive: MagicMock, vault: Path
 ) -> None:
-    def _fake_download(file_id: str, local_path: Path) -> None:
+    def _fake_download(file_id: str, local_path: Path) -> dict:
         local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_bytes(b"remote")
+        return {"id": file_id, "md5Checksum": "abc123", "appProperties": {}}
 
     drive.download.side_effect = _fake_download
 
@@ -133,6 +135,57 @@ def test_download_writes_state_entry(
     assert (vault / "notes/a.md").read_bytes() == b"remote"
     assert state.files["notes/a.md"].drive_id == "rid"
     assert state.files["notes/a.md"].size == len(b"remote")
+    assert state.files["notes/a.md"].md5 == "abc123"
+
+
+def test_download_applies_remote_version_vector(
+    engine: SyncEngine, state: SyncState, drive: MagicMock, vault: Path
+) -> None:
+    """download 후 로컬 version이 원격 appProperties의 vector로 설정된다."""
+
+    def _fake_download(file_id: str, local_path: Path) -> dict:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(b"remote data")
+        return {
+            "id": file_id,
+            "md5Checksum": "remote_md5",
+            "appProperties": {
+                "ot_sync_schema": "v2",
+                "ot_sync_deleted": "0",
+                "ot_sync_vv_a1b2c3d4": "1745000000123",
+            },
+        }
+
+    drive.download.side_effect = _fake_download
+
+    engine.execute(
+        {"type": ACTION_DOWNLOAD, "file_id": "rid2", "path": "remote.md"}
+    )
+
+    entry = state.files["remote.md"]
+    assert entry.version.counters == {"a1b2c3d4": 1745000000123}
+    assert entry.md5 == "remote_md5"
+
+
+def test_download_handles_none_md5_gracefully(
+    engine: SyncEngine, state: SyncState, drive: MagicMock, vault: Path
+) -> None:
+    """Google Docs 등 md5Checksum이 None인 파일도 정상 처리."""
+
+    def _fake_download(file_id: str, local_path: Path) -> dict:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+        local_path.write_bytes(b"google doc")
+        return {"id": file_id, "md5Checksum": None, "appProperties": {}}
+
+    drive.download.side_effect = _fake_download
+
+    engine.execute(
+        {"type": ACTION_DOWNLOAD, "file_id": "gdoc", "path": "doc.md"}
+    )
+
+    entry = state.files["doc.md"]
+    assert entry.md5 is None
+    assert entry.drive_id == "gdoc"
 
 
 # ── delete ──────────────────────────────────────────────────────────────
