@@ -33,6 +33,7 @@ IGNORE_PATTERNS: list[str] = [
     ".smart-connections/", # Smart Connections 구버전
     ".makemd/",            # MakeMD 플러그인
     ".git/",               # Git 메타데이터
+    "undefined/",          # Smart Connections가 경로 오류로 생성하는 유령 폴더
     ".DS_Store",           # macOS Finder
     "Thumbs.db",           # Windows Explorer
     "*.ajson",             # Smart Connections 임베딩 캐시 (루트/중첩 포함)
@@ -40,6 +41,16 @@ IGNORE_PATTERNS: list[str] = [
     ".smtcmp_*",           # Smart Connections 숨김 캐시
     "*.tmp",               # 임시 파일
     "*.swp",               # Vim swap
+    # 볼트 루트에 풀려 나온 Obsidian 설정 파일들 (.obsidian/ 바깥에 복사된 상태)
+    "app.json",
+    "appearance.json",
+    "community-plugins.json",
+    "core-plugins.json",
+    "workspace.json",
+    "data.json",
+    "types.json",
+    "smart_env.json",
+    "supercharged-links-gen.css",
 ]
 
 # ── 적응형 폴링 상수 ─────────────────────────────────────────────────────

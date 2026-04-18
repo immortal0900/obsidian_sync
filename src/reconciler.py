@@ -245,6 +245,8 @@ class Reconciler:
         all_paths = sorted(set(local_kinds) | set(remote_kinds))
 
         for path in all_paths:
+            if should_ignore(path):
+                continue
             local_kind = local_kinds.get(path, LOCAL_UNCHANGED)
             remote_info = remote_kinds.get(
                 path, {"kind": REMOTE_UNCHANGED, "file_id": None, "file": None}
