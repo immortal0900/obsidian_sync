@@ -1,7 +1,7 @@
 """sync_state.json 관리 (읽기/쓰기/스캔/비교).
 
 볼트의 동기화 상태를 JSON 파일로 관리한다.
-파일별 mtime, size, drive_id를 추적하고,
+파일별 mtime, size, drive_id, version vector를 추적하고,
 두 시점 간의 차이를 계산하는 기능을 제공한다.
 """
 from __future__ import annotations
@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import shutil
 import tempfile
 import threading
 import time
@@ -21,6 +22,7 @@ from src.config import (
     SyncConfig,
     should_ignore,
 )
+from src.version_vector import VersionVector
 
 logger = logging.getLogger(__name__)
 
@@ -32,21 +34,40 @@ class FileEntry:
     mtime: float
     size: int
     drive_id: str | None = None
+    version: VersionVector = field(default_factory=VersionVector.empty)
+    deleted: bool = False
+    deleted_at: float | None = None
+    md5: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """JSON 직렬화용 딕셔너리로 변환한다."""
         d: dict[str, Any] = {"mtime": self.mtime, "size": self.size}
         if self.drive_id is not None:
             d["drive_id"] = self.drive_id
+        if self.version.counters:
+            d["version"] = self.version.to_dict()
+        if self.deleted:
+            d["deleted"] = True
+        if self.deleted_at is not None:
+            d["deleted_at"] = self.deleted_at
+        if self.md5 is not None:
+            d["md5"] = self.md5
         return d
 
     @classmethod
     def from_dict(cls, data: dict[str, Any]) -> FileEntry:
-        """딕셔너리에서 FileEntry를 생성한다."""
+        """딕셔너리에서 FileEntry를 생성한다.
+
+        v1 데이터(version/deleted 없음)도 호환 처리한다.
+        """
         return cls(
             mtime=float(data["mtime"]),
             size=int(data["size"]),
             drive_id=data.get("drive_id"),
+            version=VersionVector.from_dict(data.get("version")),
+            deleted=bool(data.get("deleted", False)),
+            deleted_at=data.get("deleted_at"),
+            md5=data.get("md5"),
         )
 
 
@@ -74,7 +95,7 @@ class SyncState:
     }
     """
 
-    VERSION = 1
+    VERSION = 2
 
     def __init__(self, config: SyncConfig) -> None:
         self._config = config
@@ -113,9 +134,15 @@ class SyncState:
             self._backup_corrupt_state()
             return False
 
-        # 스키마 버전 검증 — 불일치 시 run_without_state 경로 유도
+        # 스키마 버전 검증 + v1→v2 자동 마이그레이션
         file_version = data.get("version")
-        if file_version != self.VERSION:
+        if file_version == 1:
+            logger.info("v1 → v2 자동 마이그레이션 시작")
+            self._backup_v1_state()
+            data["version"] = 2
+            # v1 entries에는 version/deleted 필드가 없으므로
+            # from_dict에서 자동으로 empty/False 기본값 적용
+        elif file_version != self.VERSION:
             logger.warning(
                 f"상태 파일 version 불일치: file={file_version}, "
                 f"expected={self.VERSION} → 전체 재동기화 모드로 전환"
@@ -132,6 +159,13 @@ class SyncState:
             for rel_path, file_data in data.get("files", {}).items():
                 self.files[rel_path] = FileEntry.from_dict(file_data)
 
+        # v1에서 마이그레이션된 경우 즉시 v2로 저장
+        if file_version == 1:
+            self.save(immediate=True)
+            logger.info(
+                f"v1 → v2 마이그레이션 완료: 파일 {len(self.files)}개"
+            )
+
         logger.info(
             f"상태 파일 로드 완료: 파일 {len(self.files)}개, "
             f"page_token={self.page_token}"
@@ -146,6 +180,15 @@ class SyncState:
             logger.info(f"상태 파일을 백업했습니다: {backup_path}")
         except OSError:
             logger.exception("상태 파일 백업 실패")
+
+    def _backup_v1_state(self) -> None:
+        """v1→v2 마이그레이션 전 v1 백업을 생성한다 (다운그레이드 안전망)."""
+        backup_path = self._state_file.with_name("sync_state.json.v1.bak")
+        try:
+            shutil.copy2(str(self._state_file), str(backup_path))
+            logger.info(f"v1 상태 파일 백업 완료: {backup_path}")
+        except OSError:
+            logger.exception("v1 상태 파일 백업 실패")
 
     def save(self, immediate: bool = False) -> None:
         """현재 상태를 sync_state.json에 저장한다.
@@ -237,14 +280,20 @@ class SyncState:
                         elif entry.is_file(follow_symlinks=False):
                             try:
                                 stat = entry.stat()
-                                # 기존 files에서 drive_id 복사
+                                # 기존 files에서 drive_id, version 복사
                                 existing = self.files.get(rel_path)
                                 drive_id = existing.drive_id if existing else None
+                                version = (
+                                    existing.version
+                                    if existing
+                                    else VersionVector.empty()
+                                )
 
                                 result[rel_path] = FileEntry(
                                     mtime=stat.st_mtime,
                                     size=stat.st_size,
                                     drive_id=drive_id,
+                                    version=version,
                                 )
                             except OSError:
                                 logger.warning(f"파일 stat 실패: {entry_path}")

@@ -220,7 +220,7 @@ class TestScenarioWarmStart:
         # 기존 state 파일을 만들어 놓는다 (v1, page_token=T0, 빈 files)
         state_file = vault / ".sync" / "sync_state.json"
         state_file.write_text(
-            '{"version": 1, "device_id": "smoke_pc", '
+            '{"version": 2, "device_id": "smoke_pc", '
             '"page_token": "T0", "last_synced_at": null, "files": {}}',
             encoding="utf-8",
         )
@@ -254,7 +254,7 @@ class TestScenarioCrossEvents:
     ) -> None:
         # 기존 state (warm start, 빈 files)
         (vault / ".sync" / "sync_state.json").write_text(
-            '{"version": 1, "device_id": "smoke_pc", '
+            '{"version": 2, "device_id": "smoke_pc", '
             '"page_token": "T0", "last_synced_at": null, "files": {}}',
             encoding="utf-8",
         )
@@ -326,7 +326,7 @@ class TestScenarioTokenInvalid:
     ) -> None:
         # 기존 state 존재 (warm start)
         (vault / ".sync" / "sync_state.json").write_text(
-            '{"version": 1, "device_id": "smoke_pc", '
+            '{"version": 2, "device_id": "smoke_pc", '
             '"page_token": "T_old", "last_synced_at": null, "files": {}}',
             encoding="utf-8",
         )

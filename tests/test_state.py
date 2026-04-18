@@ -9,6 +9,7 @@ import pytest
 
 from src.config import SyncConfig
 from src.state import FileEntry, SyncState
+from src.version_vector import VersionVector
 
 
 @pytest.fixture
@@ -90,17 +91,22 @@ class TestSyncStateLoad:
         assert sync_state.load() is False
 
     def test_load_valid_state(self, sync_state):
-        """유효한 상태 파일을 정상 로드한다."""
+        """유효한 v2 상태 파일을 정상 로드한다."""
         state_dir = sync_state._state_dir
         state_dir.mkdir(parents=True)
 
         state_data = {
-            "version": 1,
+            "version": 2,
             "device_id": "my_pc",
             "page_token": "12345",
             "last_synced_at": 1713100000.0,
             "files": {
-                "note.md": {"mtime": 1000.0, "size": 100, "drive_id": "id1"},
+                "note.md": {
+                    "mtime": 1000.0,
+                    "size": 100,
+                    "drive_id": "id1",
+                    "version": {"test_pc_": 1700000000000},
+                },
                 "daily/today.md": {"mtime": 2000.0, "size": 200},
             },
         }
@@ -114,7 +120,11 @@ class TestSyncStateLoad:
         assert sync_state.last_synced_at == 1713100000.0
         assert len(sync_state.files) == 2
         assert sync_state.files["note.md"].drive_id == "id1"
+        assert sync_state.files["note.md"].version.counters == {
+            "test_pc_": 1700000000000
+        }
         assert sync_state.files["daily/today.md"].drive_id is None
+        assert sync_state.files["daily/today.md"].version == VersionVector.empty()
 
     def test_load_corrupt_json_creates_backup(self, sync_state):
         """JSON 파싱 실패 시 .backup 파일을 생성하고 False를 반환한다."""
@@ -134,7 +144,7 @@ class TestSyncStateLoad:
         state_dir.mkdir(parents=True)
 
         future_state = {
-            "version": 2,
+            "version": 999,
             "device_id": "my_pc",
             "page_token": "x",
             "last_synced_at": 0,
@@ -161,7 +171,7 @@ class TestSyncStateSave:
 
         assert sync_state._state_file.exists()
         data = json.loads(sync_state._state_file.read_text(encoding="utf-8"))
-        assert data["version"] == 1
+        assert data["version"] == 2
         assert data["page_token"] == "99999"
         assert data["files"]["test.md"]["mtime"] == 1000.0
         assert data["files"]["test.md"]["drive_id"] == "id1"
@@ -437,3 +447,169 @@ class TestSyncStateShutdown:
 
         sync_state.shutdown()
         assert sync_state._save_timer is None
+
+
+class TestFileEntryV2:
+    """FileEntry v2 필드(version, deleted, deleted_at, md5) 테스트."""
+
+    def test_to_dict_with_version(self):
+        vv = VersionVector({"dev12345": 1700000000000})
+        entry = FileEntry(mtime=1000.0, size=100, version=vv)
+        d = entry.to_dict()
+        assert d["version"] == {"dev12345": 1700000000000}
+
+    def test_to_dict_empty_version_omitted(self):
+        entry = FileEntry(mtime=1000.0, size=100)
+        d = entry.to_dict()
+        assert "version" not in d
+
+    def test_to_dict_deleted_fields(self):
+        entry = FileEntry(
+            mtime=1000.0, size=100, deleted=True, deleted_at=1700000050.0
+        )
+        d = entry.to_dict()
+        assert d["deleted"] is True
+        assert d["deleted_at"] == 1700000050.0
+
+    def test_to_dict_deleted_false_omitted(self):
+        entry = FileEntry(mtime=1000.0, size=100, deleted=False)
+        d = entry.to_dict()
+        assert "deleted" not in d
+
+    def test_to_dict_md5(self):
+        entry = FileEntry(mtime=1000.0, size=100, md5="abc123")
+        d = entry.to_dict()
+        assert d["md5"] == "abc123"
+
+    def test_roundtrip_full(self):
+        """to_dict → from_dict 완전 왕복."""
+        vv = VersionVector({"aaaaaaaa": 100, "bbbbbbbb": 200})
+        original = FileEntry(
+            mtime=1000.5,
+            size=2048,
+            drive_id="drive_abc",
+            version=vv,
+            deleted=True,
+            deleted_at=1700000050.123,
+            md5="deadbeef",
+        )
+        restored = FileEntry.from_dict(original.to_dict())
+        assert restored.mtime == original.mtime
+        assert restored.size == original.size
+        assert restored.drive_id == original.drive_id
+        assert restored.version.counters == original.version.counters
+        assert restored.deleted == original.deleted
+        assert restored.deleted_at == original.deleted_at
+        assert restored.md5 == original.md5
+
+    def test_from_dict_v1_compat(self):
+        """v1 데이터(version/deleted 없음)에서 기본값 적용."""
+        data = {"mtime": 1000.0, "size": 100, "drive_id": "id1"}
+        entry = FileEntry.from_dict(data)
+        assert entry.version == VersionVector.empty()
+        assert entry.deleted is False
+        assert entry.deleted_at is None
+        assert entry.md5 is None
+
+    def test_default_values(self):
+        """FileEntry() 기본값 확인."""
+        entry = FileEntry(mtime=0.0, size=0)
+        assert entry.version == VersionVector.empty()
+        assert entry.deleted is False
+        assert entry.deleted_at is None
+        assert entry.md5 is None
+
+
+class TestV1ToV2Migration:
+    """v1 → v2 자동 마이그레이션 테스트."""
+
+    def test_v1_auto_migrates_to_v2(self, sync_state):
+        """v1 상태 파일이 자동으로 v2로 마이그레이션된다."""
+        state_dir = sync_state._state_dir
+        state_dir.mkdir(parents=True)
+
+        v1_data = {
+            "version": 1,
+            "device_id": "old_pc",
+            "page_token": "12345",
+            "last_synced_at": 1713100000.0,
+            "files": {
+                "note.md": {"mtime": 1000.0, "size": 100, "drive_id": "id1"},
+                "sub/doc.md": {"mtime": 2000.0, "size": 200},
+            },
+        }
+        sync_state._state_file.write_text(
+            json.dumps(v1_data), encoding="utf-8"
+        )
+
+        assert sync_state.load() is True
+        assert sync_state.device_id == "old_pc"
+        assert len(sync_state.files) == 2
+
+        # v1 entries에 version=empty, deleted=False 기본값 적용
+        entry = sync_state.files["note.md"]
+        assert entry.version == VersionVector.empty()
+        assert entry.deleted is False
+        assert entry.drive_id == "id1"
+
+    def test_v1_backup_created(self, sync_state):
+        """v1 마이그레이션 시 .v1.bak 백업 생성."""
+        state_dir = sync_state._state_dir
+        state_dir.mkdir(parents=True)
+
+        v1_data = {"version": 1, "device_id": "pc", "files": {}}
+        sync_state._state_file.write_text(
+            json.dumps(v1_data), encoding="utf-8"
+        )
+        sync_state.load()
+
+        backup = state_dir / "sync_state.json.v1.bak"
+        assert backup.exists()
+        backup_data = json.loads(backup.read_text(encoding="utf-8"))
+        assert backup_data["version"] == 1
+
+    def test_v1_migrated_file_is_v2(self, sync_state):
+        """마이그레이션 후 저장된 파일이 version=2."""
+        state_dir = sync_state._state_dir
+        state_dir.mkdir(parents=True)
+
+        v1_data = {
+            "version": 1,
+            "device_id": "pc",
+            "files": {"a.md": {"mtime": 1.0, "size": 10}},
+        }
+        sync_state._state_file.write_text(
+            json.dumps(v1_data), encoding="utf-8"
+        )
+        sync_state.load()
+
+        # 저장된 파일 확인
+        saved = json.loads(
+            sync_state._state_file.read_text(encoding="utf-8")
+        )
+        assert saved["version"] == 2
+
+
+class TestScanPreservesVersion:
+    """scan_local_files가 기존 version을 보존하는지 검증."""
+
+    def test_scan_copies_version_from_existing(self, mock_config):
+        vault = mock_config.vault_path
+        (vault / "note.md").write_text("hello", encoding="utf-8")
+
+        state = SyncState(mock_config)
+        vv = VersionVector({"dev12345": 999})
+        state.files["note.md"] = FileEntry(
+            mtime=0, size=0, drive_id="id1", version=vv
+        )
+
+        files = state.scan_local_files()
+        assert files["note.md"].version.counters == {"dev12345": 999}
+
+    def test_scan_new_file_gets_empty_version(self, mock_config):
+        vault = mock_config.vault_path
+        (vault / "new.md").write_text("new", encoding="utf-8")
+
+        state = SyncState(mock_config)
+        files = state.scan_local_files()
+        assert files["new.md"].version == VersionVector.empty()
