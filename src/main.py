@@ -288,11 +288,29 @@ def build_context(
     on_token_invalid: Callable[[], Awaitable[None]] | None = None,
 ) -> AppContext:
     """구성요소를 조립한다. 인증/load는 호출자가 수행."""
+    from src.convergence import ConvergenceManager
+    from src.intent_log import IntentLog
+
     drive = DriveClient(config)
     state = SyncState(config)
     conflict_resolver = ConflictResolver(config.device_id, config.vault_path)
     trash_manager = TrashManager(config.vault_path)
-    engine = SyncEngine(drive, state, conflict_resolver, trash_manager=trash_manager)
+
+    # Intent Log WAL (PR4)
+    intent_log_path = config.state_dir / "intent_log.jsonl"
+    intent_log = IntentLog(intent_log_path)
+
+    # Convergence Manager (PR4) — Drive callbacks wired after authentication
+    convergence = ConvergenceManager()
+    logger.info(
+        f"ConvergenceManager initialized (tombstone_retention={config.tombstone_retention_days}d)"
+    )
+
+    engine = SyncEngine(
+        drive, state, conflict_resolver,
+        trash_manager=trash_manager,
+        intent_log=intent_log,
+    )
     reconciler = Reconciler(state, drive)
     watcher = LocalWatcher(
         config.vault_path, engine, debounce_seconds=config.debounce_seconds
@@ -342,6 +360,14 @@ async def run_app(ctx: AppContext) -> int:
 
     # 상태 로드 — True: run(), False: run_without_state()
     state_loaded = ctx.state.load()
+
+    # Intent Log replay (PR4) — recover from partial failures
+    try:
+        replayed = await loop.run_in_executor(None, ctx.engine.replay_intents)
+        if replayed:
+            logger.info(f"Intent replay: {replayed}개 미해결 작업 재실행 완료")
+    except Exception:
+        logger.warning("Intent replay 실패 — 다음 sync 주기에서 재시도", exc_info=True)
 
     # 초기 reconcile
     try:

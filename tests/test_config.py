@@ -229,3 +229,65 @@ class TestIgnorePatterns:
         as_text = "|".join(IGNORE_PATTERNS)
         for pattern in required:
             assert pattern in as_text, f"누락: {pattern}"
+
+
+class TestConfigYamlParsing:
+    """Sprint 4 P0-4: config YAML 파싱 검증."""
+
+    def test_hash_and_tombstone_fields_from_yaml(self, tmp_path):
+        """hash_max_file_size_mb, hash_verification, tombstone_retention_days가 YAML에서 파싱된다."""
+        vault_dir = tmp_path / "vault"
+        vault_dir.mkdir()
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text("{}", encoding="utf-8")
+
+        config_data = {
+            "watch_paths": [{"path": str(vault_dir)}],
+            "drive": {
+                "credentials_file": str(creds_file),
+                "token_file": "token.json",
+                "folder_id": "some_id",
+            },
+            "sync": {
+                "hash_max_file_size_mb": 50,
+                "hash_verification": False,
+                "tombstone_retention_days": 180,
+                "trash_retention_days": 14,
+            },
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.dump(config_data, allow_unicode=True), encoding="utf-8"
+        )
+
+        config = SyncConfig.from_yaml(config_path)
+        assert config.hash_max_file_size_mb == 50
+        assert config.hash_verification is False
+        assert config.tombstone_retention_days == 180
+        assert config.trash_retention_days == 14
+
+    def test_hash_and_tombstone_fields_defaults(self, tmp_path):
+        """hash/tombstone 필드가 없으면 기본값을 사용한다."""
+        vault_dir = tmp_path / "vault"
+        vault_dir.mkdir()
+        creds_file = tmp_path / "credentials.json"
+        creds_file.write_text("{}", encoding="utf-8")
+
+        config_data = {
+            "watch_paths": [{"path": str(vault_dir)}],
+            "drive": {
+                "credentials_file": str(creds_file),
+                "token_file": "token.json",
+                "folder_id": "some_id",
+            },
+        }
+        config_path = tmp_path / "config.yaml"
+        config_path.write_text(
+            yaml.dump(config_data, allow_unicode=True), encoding="utf-8"
+        )
+
+        config = SyncConfig.from_yaml(config_path)
+        assert config.hash_max_file_size_mb == 100
+        assert config.hash_verification is True
+        assert config.tombstone_retention_days == 90
+        assert config.trash_retention_days == 30

@@ -85,6 +85,7 @@ class SyncConfig:
     trash_retention_days: int = DEFAULT_TRASH_RETENTION_DAYS
     hash_max_file_size_mb: int = 100
     hash_verification: bool = True
+    tombstone_retention_days: int = 90
     log_level: str = "INFO"
     log_file: str = "obsidian_sync.log"
     log_max_bytes: int = 5 * 1024 * 1024
@@ -133,6 +134,11 @@ class SyncConfig:
         trash_retention_days = int(
             sync_cfg.get("trash_retention_days", DEFAULT_TRASH_RETENTION_DAYS)
         )
+        hash_max_file_size_mb = int(sync_cfg.get("hash_max_file_size_mb", 100))
+        hash_verification = bool(sync_cfg.get("hash_verification", True))
+        tombstone_retention_days = int(
+            sync_cfg.get("tombstone_retention_days", 90)
+        )
 
         # logging 섹션
         log_cfg = raw.get("logging", {})
@@ -162,6 +168,9 @@ class SyncConfig:
             debounce_seconds=debounce_seconds,
             delete_local=delete_local,
             trash_retention_days=trash_retention_days,
+            hash_max_file_size_mb=hash_max_file_size_mb,
+            hash_verification=hash_verification,
+            tombstone_retention_days=tombstone_retention_days,
             log_level=log_level,
             log_file=log_file,
             log_max_bytes=log_max_bytes,
