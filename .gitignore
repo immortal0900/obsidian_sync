@@ -23,7 +23,9 @@ daemon.lock
 nssm.exe
 .coverage
 htmlcov/
-
+.artifacts/
+.templates/
+CLAUDE.md
 # IDE / tool settings
 .claude/
 .obsidian/
