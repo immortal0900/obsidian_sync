@@ -32,6 +32,10 @@ class VersionVector:
 
     counters: dict[str, int]
 
+    def __bool__(self) -> bool:
+        """Empty vector is falsy, non-empty is truthy."""
+        return bool(self.counters)
+
     @staticmethod
     def empty() -> VersionVector:
         """빈 버전 벡터를 생성한다."""
@@ -125,7 +129,3 @@ class VersionVector:
         if not data:
             return cls.empty()
         return cls({str(k): int(v) for k, v in data.items()})
-
-    def __bool__(self) -> bool:
-        """빈 벡터이면 False."""
-        return bool(self.counters)

@@ -23,6 +23,10 @@ from src.version_vector import VectorOrdering, VersionVector
 
 logger = logging.getLogger(__name__)
 
+# Pseudo device ID for remote-only version bumps (e.g., remote deletion
+# detected via Changes API without appProperties vector).
+REMOTE_PSEUDO_DEVICE = "_remote_"
+
 
 # ── Action types ──────────────────────────────────────────────────────
 
@@ -85,9 +89,11 @@ def decide(
         return decide_upload_or_delete(local)
 
     # Both exist
-    # Content identical → vector merge only
+    # Content identical → vector merge only (skip if either side is a tombstone)
     if (
-        local.md5 is not None
+        not local.deleted
+        and not remote.deleted
+        and local.md5 is not None
         and remote.md5 is not None
         and local.md5 == remote.md5
         and local.size == remote.size
@@ -315,7 +321,7 @@ class Reconciler:
                 mtime=0.0,
                 size=0,
                 drive_id=file_id,
-                version=old_version.update("_remote_"),  # different device
+                version=old_version.update(REMOTE_PSEUDO_DEVICE),  # different device
                 deleted=True,
             )
 
@@ -325,7 +331,7 @@ class Reconciler:
         # Parse appProperties for version vector
         app_props = file_meta.get("appProperties")
         remote_vv, deleted, remote_md5 = vv_decode(app_props)
-        if not remote_vv:
+        if remote_vv is None or not remote_vv.counters:
             remote_vv = VersionVector.empty()
 
         remote_mtime = _parse_rfc3339(file_meta.get("modifiedTime"))

@@ -559,3 +559,154 @@ class TestMetadataOnlySkip:
         # md5 match → UpdateVectorOnly → no actual transfer action
         download_actions = [a for a in actions if a.get("type") == "download"]
         assert len(download_actions) == 0
+
+
+# ── Sprint 4 P0-5(c): run_without_state non-empty version branch ────
+
+
+class TestRunWithoutStateNonEmptyVersion:
+    """Cover reconciler.py:502-530 — both exist + md5 differ + local.version != empty."""
+
+    def test_local_greater_uploads(self, state, mock_drive):
+        """Non-empty local version > remote → upload."""
+        vault = state.vault_path
+        _write_file(vault, "edited.md", b"local_content")
+
+        # Seed local with a non-empty version (simulates state existed then was rebuilt)
+        state.files["edited.md"] = FileEntry(
+            mtime=1000.0,
+            size=13,
+            version=VersionVector({"my_devic": 2000}),
+        )
+
+        mock_drive.list_all_files.return_value = [
+            {
+                "id": "r_edited",
+                "name": "edited.md",
+                "relative_path": "edited.md",
+                "md5Checksum": "different_md5",
+                "modifiedTime": "2026-01-01T00:00:00Z",
+                "size": "20",
+                "appProperties": {
+                    "ot_sync_schema": "v2",
+                    "ot_sync_deleted": "0",
+                    "ot_sync_vv_my_devic": "1000",  # lower than local
+                },
+            }
+        ]
+        mock_drive.get_initial_token.return_value = "new_token"
+
+        r = Reconciler(state, mock_drive)
+        actions = r.run_without_state()
+
+        upload_actions = [a for a in actions if a.get("type") == "upload"]
+        assert len(upload_actions) == 1
+        assert upload_actions[0]["path"] == "edited.md"
+
+    def test_remote_greater_downloads(self, state, mock_drive):
+        """Non-empty local version < remote → download."""
+        vault = state.vault_path
+        _write_file(vault, "stale.md", b"old_local")
+
+        state.files["stale.md"] = FileEntry(
+            mtime=1000.0,
+            size=9,
+            version=VersionVector({"my_devic": 500}),
+        )
+
+        mock_drive.list_all_files.return_value = [
+            {
+                "id": "r_stale",
+                "name": "stale.md",
+                "relative_path": "stale.md",
+                "md5Checksum": "remote_different_md5",
+                "modifiedTime": "2026-06-01T00:00:00Z",
+                "size": "30",
+                "appProperties": {
+                    "ot_sync_schema": "v2",
+                    "ot_sync_deleted": "0",
+                    "ot_sync_vv_my_devic": "3000",  # higher than local
+                },
+            }
+        ]
+        mock_drive.get_initial_token.return_value = "new_token"
+
+        r = Reconciler(state, mock_drive)
+        actions = r.run_without_state()
+
+        download_actions = [a for a in actions if a.get("type") == "download"]
+        assert len(download_actions) == 1
+        assert download_actions[0]["path"] == "stale.md"
+
+    def test_concurrent_triggers_conflict(self, state, mock_drive):
+        """Non-empty local version concurrent with remote → conflict."""
+        vault = state.vault_path
+        _write_file(vault, "conflict.md", b"my_edits")
+
+        # Local has device A counter, remote has device B counter → concurrent
+        state.files["conflict.md"] = FileEntry(
+            mtime=1000.0,
+            size=8,
+            version=VersionVector({"device_a": 2000}),
+        )
+
+        mock_drive.list_all_files.return_value = [
+            {
+                "id": "r_conflict",
+                "name": "conflict.md",
+                "relative_path": "conflict.md",
+                "md5Checksum": "remote_md5",
+                "modifiedTime": "2026-06-01T00:00:00Z",
+                "size": "15",
+                "appProperties": {
+                    "ot_sync_schema": "v2",
+                    "ot_sync_deleted": "0",
+                    "ot_sync_vv_device_b": "3000",  # different device → concurrent
+                },
+            }
+        ]
+        mock_drive.get_initial_token.return_value = "new_token"
+
+        r = Reconciler(state, mock_drive)
+        actions = r.run_without_state()
+
+        conflict_actions = [a for a in actions if a.get("type") == "conflict"]
+        assert len(conflict_actions) == 1
+        assert conflict_actions[0]["path"] == "conflict.md"
+
+
+# ── Sprint 4 P0-5(b): deleted entry md5 guard ───────────────────────
+
+
+class TestDeletedEntryMd5Guard:
+    """Both deleted + same md5 should NOT return UpdateVectorOnly."""
+
+    def test_both_deleted_same_md5_not_update_vector(self):
+        """If both are deleted tombstones with same md5, decide() falls through to version compare."""
+        local = FileEntry(
+            mtime=1.0, size=10, md5="same", deleted=True,
+            version=VersionVector({"dev_a": 1000}),
+        )
+        remote = FileEntry(
+            mtime=1.0, size=10, md5="same", deleted=True,
+            version=VersionVector({"dev_a": 1000}),
+        )
+        action = decide(local, remote)
+        # Should be NoOp (Equal versions), NOT UpdateVectorOnly
+        assert isinstance(action, NoOp)
+
+
+# ── Sprint 4 P0-5(d): VersionVector __bool__ ────────────────────────
+
+
+class TestVersionVectorBool:
+    def test_empty_vector_is_falsy(self):
+        assert not VersionVector.empty()
+        assert not VersionVector({})
+
+    def test_nonempty_vector_is_truthy(self):
+        assert VersionVector({"dev": 1})
+
+    def test_remote_pseudo_device_constant(self):
+        from src.reconciler import REMOTE_PSEUDO_DEVICE
+        assert REMOTE_PSEUDO_DEVICE == "_remote_"

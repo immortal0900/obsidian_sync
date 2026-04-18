@@ -36,7 +36,7 @@ def test_record_resolve_roundtrip(intent_log: IntentLog, log_path: Path) -> None
     intent_log.resolve(intent_id)
 
     # Both lines should be in the file
-    lines = [l for l in log_path.read_text("utf-8").strip().split("\n") if l]
+    lines = [ln for ln in log_path.read_text("utf-8").strip().split("\n") if ln]
     assert len(lines) == 2
 
     record_line = json.loads(lines[0])
@@ -70,8 +70,8 @@ def test_replay_unresolved_intents(intent_log: IntentLog) -> None:
     action1 = {"type": "delete_remote", "file_id": "abc", "path": "old.md"}
     action2 = {"type": "upload", "path": "new.md"}
 
-    id1 = intent_log.record(action1)
-    intent_log.record(action2)  # id2 - also unresolved
+    intent_log.record(action1)
+    intent_log.record(action2)  # both unresolved
 
     execute_fn = MagicMock()
     count = intent_log.replay(execute_fn)
@@ -136,7 +136,7 @@ def test_compact_removes_resolved(intent_log: IntentLog, log_path: Path) -> None
 
     # Only unresolved remains
     content = log_path.read_text("utf-8").strip()
-    lines = [l for l in content.split("\n") if l]
+    lines = [ln for ln in content.split("\n") if ln]
     assert len(lines) == 1
     entry = json.loads(lines[0])
     assert entry["id"] == id2
@@ -187,7 +187,7 @@ def test_sigkill_simulation(tmp_path: Path) -> None:
     # Process 1: record intent, then "crash" (no resolve)
     log1 = IntentLog(log_path)
     action = {"type": "delete_remote", "file_id": "xyz", "path": "notes/old.md"}
-    intent_id = log1.record(action)
+    log1.record(action)
     # SIGKILL here — no resolve()
 
     # Process 2: new IntentLog instance, replay

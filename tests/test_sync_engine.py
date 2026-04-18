@@ -534,7 +534,7 @@ def test_intent_log_record_resolve_on_upload(
     engine.execute({"type": ACTION_UPLOAD, "path": "test.md"})
 
     # Should have record + resolve lines
-    lines = [l for l in log_path.read_text("utf-8").strip().split("\n") if l]
+    lines = [ln for ln in log_path.read_text("utf-8").strip().split("\n") if ln]
     assert len(lines) == 2
 
     import json
@@ -560,7 +560,7 @@ def test_intent_log_no_resolve_on_failure(
 
     engine.execute({"type": ACTION_UPLOAD, "path": "fail.md"})
 
-    lines = [l for l in log_path.read_text("utf-8").strip().split("\n") if l]
+    lines = [ln for ln in log_path.read_text("utf-8").strip().split("\n") if ln]
     assert len(lines) == 1  # record only, no resolve
 
 

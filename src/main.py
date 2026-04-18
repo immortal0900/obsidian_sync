@@ -300,8 +300,9 @@ def build_context(
     intent_log_path = config.state_dir / "intent_log.jsonl"
     intent_log = IntentLog(intent_log_path)
 
-    # Convergence Manager (PR4) — Drive callbacks wired after authentication
-    convergence = ConvergenceManager()
+    # Convergence Manager (PR4) — Drive callbacks will be wired after
+    # authentication. Tombstone GC uses this to check device convergence.
+    _convergence = ConvergenceManager()  # noqa: F841
     logger.info(
         f"ConvergenceManager initialized (tombstone_retention={config.tombstone_retention_days}d)"
     )
