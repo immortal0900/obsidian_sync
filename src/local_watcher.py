@@ -22,16 +22,12 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# 이동 이벤트 디바운스 키 접두어 — upload/delete 타이머 키와 충돌 방지
-_MOVED_KEY_PREFIX = "__moved__:"
-
-
 class LocalWatcher(FileSystemEventHandler):
     """볼트 디렉토리의 파일 변경을 감시하여 sync_engine에 전달한다.
 
     - 같은 경로에 대한 연속 이벤트는 `debounce_seconds` 내에 1회로 집계된다.
     - 삭제 이벤트는 즉시 전파한다.
-    - 이동 이벤트는 sync_engine에 `rename_remote` 액션으로 위임한다.
+    - 이동 이벤트는 delete(old) + create(new)로 분해한다.
     """
 
     def __init__(
@@ -194,38 +190,6 @@ class LocalWatcher(FileSystemEventHandler):
             self._sync_engine.handle_local_change(event_type, rel_path)
         except Exception:
             logger.exception(f"디바운스 이벤트 전파 실패: {rel_path}")
-
-    def _schedule_move(self, old_path: str, new_path: str) -> None:
-        """이동 이벤트를 디바운스 후 rename_remote 액션으로 발사한다."""
-        key = f"{_MOVED_KEY_PREFIX}{new_path}"
-
-        with self._timers_lock:
-            existing = self._timers.get(key)
-            if existing is not None:
-                existing.cancel()
-
-            timer = threading.Timer(
-                self._debounce_seconds,
-                self._fire_move,
-                args=(old_path, new_path, key),
-            )
-            timer.daemon = True
-            self._timers[key] = timer
-            timer.start()
-
-    def _fire_move(self, old_path: str, new_path: str, key: str) -> None:
-        with self._timers_lock:
-            self._timers.pop(key, None)
-        action = {
-            "type": "rename_remote",
-            "old_path": old_path,
-            "new_path": new_path,
-            "reason": "local_moved",
-        }
-        try:
-            self._sync_engine.execute(action)
-        except Exception:
-            logger.exception(f"이동 이벤트 전파 실패: {old_path} → {new_path}")
 
     # ── 필터링 ───────────────────────────────────────────────────────────
 

@@ -204,7 +204,9 @@ class TestIgnorePatterns:
 
 
 class TestMoved:
-    def test_moved_debounces_and_emits_rename_remote(
+    """on_moved → delete(old) + create(new) 분해 검증 (spec v2 P1 2-C)."""
+
+    def test_moved_decomposes_to_delete_and_create(
         self, watcher: LocalWatcher, mock_engine: MagicMock, tmp_vault: Path
     ) -> None:
         event = FakeEvent(
@@ -212,15 +214,18 @@ class TestMoved:
             dest_path=str(tmp_vault / "new.md"),
         )
         watcher.on_moved(event)
+
+        # delete(old) 즉시 호출
+        mock_engine.handle_local_change.assert_called_with("deleted", "old.md")
+
+        # create(new) 디바운스 후 호출
         _wait_debounce()
+        calls = mock_engine.handle_local_change.call_args_list
+        assert len(calls) == 2
+        assert calls[0].args == ("deleted", "old.md")
+        assert calls[1].args == ("created", "new.md")
 
-        mock_engine.execute.assert_called_once()
-        action = mock_engine.execute.call_args.args[0]
-        assert action["type"] == "rename_remote"
-        assert action["old_path"] == "old.md"
-        assert action["new_path"] == "new.md"
-
-    def test_moved_same_dest_debounces(
+    def test_moved_same_dest_debounces_create(
         self, watcher: LocalWatcher, mock_engine: MagicMock, tmp_vault: Path
     ) -> None:
         for _ in range(3):
@@ -232,7 +237,17 @@ class TestMoved:
             time.sleep(0.01)
         _wait_debounce()
 
-        assert mock_engine.execute.call_count == 1
+        # delete는 3회 즉시 호출, create는 디바운스되어 1회
+        delete_calls = [
+            c for c in mock_engine.handle_local_change.call_args_list
+            if c.args[0] == "deleted"
+        ]
+        create_calls = [
+            c for c in mock_engine.handle_local_change.call_args_list
+            if c.args[0] == "created"
+        ]
+        assert len(delete_calls) == 3
+        assert len(create_calls) == 1
 
     def test_moved_directory_dropped(
         self, watcher: LocalWatcher, mock_engine: MagicMock, tmp_vault: Path
@@ -244,7 +259,7 @@ class TestMoved:
         )
         watcher.on_moved(event)
         _wait_debounce()
-        mock_engine.execute.assert_not_called()
+        mock_engine.handle_local_change.assert_not_called()
 
 
 class TestLastEventAge:

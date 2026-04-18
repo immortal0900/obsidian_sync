@@ -30,6 +30,7 @@ from src.poller import AdaptivePoller
 from src.reconciler import Reconciler
 from src.state import SyncState
 from src.sync_engine import SyncEngine
+from src.trash import TrashManager
 
 logger = logging.getLogger(__name__)
 
@@ -290,7 +291,9 @@ def build_context(
     drive = DriveClient(config)
     state = SyncState(config)
     conflict_resolver = ConflictResolver(config.device_id, config.vault_path)
-    engine = SyncEngine(drive, state, conflict_resolver)
+    trash_dir = config.vault_path / ".sync" / "trash"
+    trash_manager = TrashManager(trash_dir)
+    engine = SyncEngine(drive, state, conflict_resolver, trash_manager=trash_manager)
     reconciler = Reconciler(state, drive)
     watcher = LocalWatcher(
         config.vault_path, engine, debounce_seconds=config.debounce_seconds

@@ -110,6 +110,7 @@ class SyncState:
         self.page_token: str | None = None
         self.last_synced_at: float | None = None
         self.files: dict[str, FileEntry] = {}
+        self.known_device_ids: set[str] = set()  # 충돌 감지용 전체 device_id 목록
 
     @property
     def vault_path(self) -> Path:
@@ -158,6 +159,7 @@ class SyncState:
             self.files = {}
             for rel_path, file_data in data.get("files", {}).items():
                 self.files[rel_path] = FileEntry.from_dict(file_data)
+            self.known_device_ids = set(data.get("known_device_ids", []))
 
         # v1에서 마이그레이션된 경우 즉시 v2로 저장
         if file_version == 1:
@@ -185,17 +187,24 @@ class SyncState:
             logger.exception("상태 파일 백업 실패")
 
     def _check_device_prefix_collision(self) -> None:
-        """기존 state의 version vector에 동일 prefix가 다른 device에서 사용되는지 검사."""
+        """known_device_ids 중 다른 device가 동일 8자 prefix를 갖는지 검사.
+
+        VV counters에는 prefix(8자)만 저장되므로, 충돌 감지를 위해
+        전체 device_id를 known_device_ids에 별도 추적한다.
+        PR2에서 원격 vector 수신 시 known_device_ids가 채워진다.
+        """
         my_prefix = self.device_id[:8]
-        for rel_path, entry in self.files.items():
-            for dev_prefix in entry.version.counters:
-                if dev_prefix == my_prefix and dev_prefix != self.device_id[:8]:
-                    logger.warning(
-                        f"device_id prefix 충돌 감지: "
-                        f"내 prefix={my_prefix}, 파일={rel_path}의 "
-                        f"vector에 동일 prefix가 다른 기기에서 사용됨"
-                    )
-                    return  # 한 번만 경고
+        for other_id in self.known_device_ids:
+            if other_id == self.device_id:
+                continue
+            if other_id[:8] == my_prefix:
+                logger.warning(
+                    f"device_id prefix 충돌 감지: "
+                    f"내 device={self.device_id}, "
+                    f"다른 device={other_id}, "
+                    f"공유 prefix={my_prefix}"
+                )
+                return  # 한 번만 경고
 
     def _backup_v1_state(self) -> None:
         """v1→v2 마이그레이션 전 v1 백업을 생성한다 (다운그레이드 안전망)."""
@@ -241,6 +250,7 @@ class SyncState:
                 "device_id": self.device_id,
                 "page_token": self.page_token,
                 "last_synced_at": self.last_synced_at,
+                "known_device_ids": sorted(self.known_device_ids),
                 "files": {
                     path: entry.to_dict()
                     for path, entry in self.files.items()

@@ -52,7 +52,7 @@ next_sprint_preview: |
 ## Definition of Done
 
 - [x] 모든 P0 체크박스 완료
-- [ ] `ruff check` 통과
+- [x] `ruff check` 통과
 - [x] `pytest` 통과 (신규 파일 커버리지 ≥ 90%)
 - [x] 기존 테스트 회귀 없음 (v2 마이그레이션으로 인한 깨짐 0건)
 - [x] progress-log.md 업데이트
