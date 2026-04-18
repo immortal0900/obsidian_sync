@@ -239,7 +239,8 @@ class SyncEngine:
         existing_id = existing.drive_id if existing else None
         old_version = existing.version if existing else VersionVector.empty()
 
-        drive_id = self._drive.upload(local_abs, path, existing_id=existing_id)
+        result = self._drive.upload(local_abs, path, existing_id=existing_id)
+        drive_id = result["id"] if isinstance(result, dict) else result
 
         stat = local_abs.stat()
         new_version = old_version.update(self._state.device_id)
@@ -283,7 +284,7 @@ class SyncEngine:
         file_id: str = action["file_id"]
         path: str | None = action.get("path")
 
-        self._drive.delete(file_id)
+        self._drive.hard_delete(file_id)
 
         if path is not None:
             existing = self._state.files.get(path)

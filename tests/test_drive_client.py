@@ -98,7 +98,7 @@ class TestUpload:
         mock_create_folder.return_value.execute.return_value = {"id": "new_file_id"}
 
         result = drive_client.upload(test_file, "test.md")
-        assert result == "new_file_id"
+        assert result["id"] == "new_file_id"
 
     def test_upload_existing_file(self, drive_client, tmp_path):
         """existing_id가 있으면 update를 호출한다."""
@@ -106,10 +106,13 @@ class TestUpload:
         test_file.write_text("updated content", encoding="utf-8")
 
         mock_update = drive_client._service.files().update
-        mock_update.return_value.execute.return_value = {}
+        mock_update.return_value.execute.return_value = {
+            "id": "existing_123",
+            "md5Checksum": "abc123",
+        }
 
         result = drive_client.upload(test_file, "test.md", existing_id="existing_123")
-        assert result == "existing_123"
+        assert result["id"] == "existing_123"
 
 
 class TestDownload:
@@ -123,10 +126,19 @@ class TestDownload:
         mock_get_media = drive_client._service.files().get_media
         mock_get_media.return_value.execute.return_value = content
 
-        drive_client.download("file_id_123", local_path)
+        # download now also calls get for metadata
+        mock_get = drive_client._service.files().get
+        mock_get.return_value.execute.return_value = {
+            "id": "file_id_123",
+            "md5Checksum": "abc",
+            "appProperties": {},
+        }
+
+        result = drive_client.download("file_id_123", local_path)
 
         assert local_path.exists()
         assert local_path.read_bytes() == content
+        assert result["id"] == "file_id_123"
 
     def test_download_creates_parent_dirs(self, drive_client, tmp_path):
         """부모 디렉토리가 없으면 자동 생성한다."""
@@ -135,19 +147,93 @@ class TestDownload:
         mock_get_media = drive_client._service.files().get_media
         mock_get_media.return_value.execute.return_value = b"data"
 
+        mock_get = drive_client._service.files().get
+        mock_get.return_value.execute.return_value = {
+            "id": "file_id",
+            "md5Checksum": None,
+            "appProperties": {},
+        }
+
         drive_client.download("file_id", local_path)
         assert local_path.parent.exists()
 
 
-class TestDelete:
-    """DriveClient.delete 테스트."""
+class TestHardDelete:
+    """DriveClient.hard_delete 테스트."""
 
-    def test_delete_trashes_file(self, drive_client):
-        """delete가 trashed=True로 업데이트한다."""
-        drive_client.delete("file_id_123")
+    def test_hard_delete_trashes_file(self, drive_client):
+        """hard_delete가 trashed=True로 업데이트한다."""
+        drive_client.hard_delete("file_id_123")
 
         drive_client._service.files().update.assert_called_with(
             fileId="file_id_123", body={"trashed": True}
+        )
+
+
+class TestTombstones:
+    """DriveClient tombstones 관련 테스트."""
+
+    def test_ensure_tombstones_folder_creates_when_missing(self, drive_client):
+        """tombstones 폴더가 없으면 생성한다."""
+        # find_folder returns None (not found), then create_folder creates it
+        list_req = drive_client._service.files().list.return_value
+        list_req.execute.return_value = {"files": []}
+
+        create_req = drive_client._service.files().create.return_value
+        # First call: .sync folder, second: tombstones folder
+        create_req.execute.side_effect = [
+            {"id": "sync_folder_id"},
+            {"id": "tombstones_folder_id"},
+        ]
+
+        result = drive_client.ensure_tombstones_folder()
+        assert result == "tombstones_folder_id"
+        assert drive_client._tombstones_folder_id == "tombstones_folder_id"
+
+    def test_ensure_tombstones_folder_cached(self, drive_client):
+        """두 번째 호출은 캐시를 사용한다."""
+        drive_client._tombstones_folder_id = "cached_id"
+        result = drive_client.ensure_tombstones_folder()
+        assert result == "cached_id"
+        # No API calls
+        drive_client._service.files().list.assert_not_called()
+
+    def test_ensure_tombstones_folder_no_duplicate(self, drive_client):
+        """이미 존재하는 tombstones 폴더는 재생성하지 않는다."""
+        list_req = drive_client._service.files().list.return_value
+        # First list: .sync folder exists, second list: tombstones exists
+        list_req.execute.side_effect = [
+            {"files": [{"id": "sync_id"}]},
+            {"files": [{"id": "tombstones_id"}]},
+        ]
+
+        result = drive_client.ensure_tombstones_folder()
+        assert result == "tombstones_id"
+
+    def test_move_to_tombstones(self, drive_client):
+        """파일을 tombstones 폴더로 이동한다."""
+        drive_client._tombstones_folder_id = "tomb_id"
+
+        # get parents
+        get_req = drive_client._service.files().get.return_value
+        get_req.execute.return_value = {"parents": ["old_parent"]}
+
+        # update (move)
+        update_req = drive_client._service.files().update.return_value
+        update_req.execute.return_value = {
+            "id": "file123",
+            "parents": ["tomb_id"],
+        }
+
+        app_props = {"ot_sync_deleted": "1"}
+        drive_client.move_to_tombstones("file123", app_properties=app_props)
+
+        drive_client._service.files().update.assert_called_with(
+            fileId="file123",
+            addParents="tomb_id",
+            removeParents="old_parent",
+            body={"appProperties": app_props},
+            fields="id,parents,appProperties",
         )
 
 
@@ -883,14 +969,14 @@ class TestFileOpsRetry:
         waits = [c.args[0] for c in mock_sleep.call_args_list]
         assert waits == [1.0, 2.0, 4.0]
 
-    def test_delete_retries_5xx(self, drive_client):
+    def test_hard_delete_retries_5xx(self, drive_client):
         err = _make_http_error(503)
         req = drive_client._service.files().update.return_value
         req.execute.side_effect = [err, err, err, err]
 
         with patch("src.drive_client.time.sleep") as mock_sleep:
             with pytest.raises(HttpError):
-                drive_client.delete("fid")
+                drive_client.hard_delete("fid")
 
         waits = [c.args[0] for c in mock_sleep.call_args_list]
         assert waits == [1.0, 2.0, 4.0]
@@ -978,14 +1064,14 @@ class TestFileOps404Policy:
 
         assert excinfo.value.file_id == "missing"
 
-    def test_delete_404_raises_not_found(self, drive_client):
+    def test_hard_delete_404_raises_not_found(self, drive_client):
         err = _make_http_error(404)
         req = drive_client._service.files().update.return_value
         req.execute.side_effect = err
 
         with patch("src.drive_client.time.sleep"):
             with pytest.raises(DriveFileNotFoundError) as excinfo:
-                drive_client.delete("missing")
+                drive_client.hard_delete("missing")
 
         assert excinfo.value.file_id == "missing"
 
@@ -1057,9 +1143,9 @@ class TestNestedUploadIntegration:
             {"id": "file_id"},
         ]
 
-        file_id = drive_client.upload(local, "foo/bar/note.md")
+        result = drive_client.upload(local, "foo/bar/note.md")
 
-        assert file_id == "file_id"
+        assert result["id"] == "file_id"
         # _folder_cache에 foo, foo/bar 등록됨
         assert drive_client._folder_cache["foo"] == "foo_id"
         assert drive_client._folder_cache["foo/bar"] == "foo_bar_id"

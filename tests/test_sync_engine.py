@@ -53,7 +53,7 @@ def state(config: SyncConfig) -> SyncState:
 @pytest.fixture
 def drive() -> MagicMock:
     mock = MagicMock()
-    mock.upload.return_value = "drive_id_new"
+    mock.upload.return_value = {"id": "drive_id_new", "md5Checksum": None}
     return mock
 
 
@@ -145,7 +145,7 @@ def test_delete_remote_marks_deleted_in_state(
     engine.execute(
         {"type": ACTION_DELETE_REMOTE, "file_id": "did", "path": "note.md"}
     )
-    drive.delete.assert_called_once_with("did")
+    drive.hard_delete.assert_called_once_with("did")
     # v2: deleted=True + version 갱신으로 tombstone 기록
     assert "note.md" in state.files
     assert state.files["note.md"].deleted is True
@@ -296,14 +296,14 @@ def test_handle_local_change_deleted_uses_state_drive_id(
 ) -> None:
     state.files["x.md"] = FileEntry(mtime=1.0, size=1, drive_id="did")
     engine.handle_local_change("deleted", "x.md")
-    drive.delete.assert_called_once_with("did")
+    drive.hard_delete.assert_called_once_with("did")
 
 
 def test_handle_local_change_deleted_unknown_file_noop(
     engine: SyncEngine, drive: MagicMock
 ) -> None:
     engine.handle_local_change("deleted", "unknown.md")
-    drive.delete.assert_not_called()
+    drive.hard_delete.assert_not_called()
 
 
 def test_handle_local_change_unsupported_event(
@@ -311,7 +311,7 @@ def test_handle_local_change_unsupported_event(
 ) -> None:
     engine.handle_local_change("weird_event", "x.md")
     drive.upload.assert_not_called()
-    drive.delete.assert_not_called()
+    drive.hard_delete.assert_not_called()
 
 
 # ── handle_remote_changes ───────────────────────────────────────────────
@@ -400,7 +400,7 @@ def test_delete_remote_404_removes_state_entry(
 ) -> None:
     """delete가 404를 받으면 sync_engine이 state에서 해당 drive_id를 제거한다."""
     state.files["note.md"] = FileEntry(mtime=1.0, size=1, drive_id="missing")
-    drive.delete.side_effect = DriveFileNotFoundError("missing")
+    drive.hard_delete.side_effect = DriveFileNotFoundError("missing")
 
     engine.execute(
         {
@@ -453,7 +453,7 @@ def test_404_cleanup_without_path_hint(
     """path 힌트가 없어도 drive_id 전체 스캔으로 정리한다."""
     state.files["a.md"] = FileEntry(mtime=1.0, size=1, drive_id="orphan")
     state.files["b.md"] = FileEntry(mtime=2.0, size=2, drive_id="keep")
-    drive.delete.side_effect = DriveFileNotFoundError("orphan")
+    drive.hard_delete.side_effect = DriveFileNotFoundError("orphan")
 
     engine.execute({"type": ACTION_DELETE_REMOTE, "file_id": "orphan"})
 

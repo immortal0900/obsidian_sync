@@ -158,6 +158,9 @@ class DriveClient:
         # 볼트 트리에 속하지 않는 것으로 확인된 폴더 ID 캐시 (반복 조회 방지)
         self._non_vault_ids: set[str] = set()
 
+        # .sync/tombstones/ 폴더 ID 캐시 (세션 내 1회 조회)
+        self._tombstones_folder_id: str | None = None
+
     # ── 인증 ──────────────────────────────────────────────────────────────
 
     def authenticate(self) -> None:
@@ -206,48 +209,60 @@ class DriveClient:
         local_path: Path,
         relative_path: str,
         existing_id: str | None = None,
-    ) -> str:
+        *,
+        app_properties: dict[str, str] | None = None,
+    ) -> dict:
         """로컬 파일을 Drive에 업로드한다.
 
         existing_id가 있으면 update, 없으면 create.
-        반환값: Drive 파일 ID.
+        app_properties가 주어지면 appProperties에 포함한다.
+        반환값: Drive 파일 메타데이터 dict (id, md5Checksum 등).
         """
         media = googleapiclient.http.MediaFileUpload(
             str(local_path), resumable=False
         )
 
         if existing_id:
+            body: dict[str, Any] = {"name": local_path.name}
+            if app_properties:
+                body["appProperties"] = app_properties
             request = self._service.files().update(
                 fileId=existing_id,
-                body={"name": local_path.name},
+                body=body,
                 media_body=media,
+                fields="id,md5Checksum,appProperties",
             )
-            _execute_with_retry(
+            result = _execute_with_retry(
                 request,
                 description=f"upload.update[{relative_path}]",
                 not_found_file_id=existing_id,
             )
             logger.info(f"Drive 업데이트: {relative_path}")
-            return existing_id
+            return result
         else:
             # 부모 폴더 확보
             parent_rel = relative_path.rsplit("/", 1)[0] if "/" in relative_path else ""
             parent_id = self.ensure_folder_path(parent_rel)
 
-            meta = {"name": local_path.name, "parents": [parent_id]}
+            meta: dict[str, Any] = {"name": local_path.name, "parents": [parent_id]}
+            if app_properties:
+                meta["appProperties"] = app_properties
             request = (
                 self._service.files()
-                .create(body=meta, media_body=media, fields="id")
+                .create(body=meta, media_body=media, fields="id,md5Checksum,appProperties")
             )
             result = _execute_with_retry(
                 request, description=f"upload.create[{relative_path}]"
             )
             file_id = result["id"]
             logger.info(f"Drive 업로드: {relative_path} (id={file_id})")
-            return file_id
+            return result
 
-    def download(self, drive_file_id: str, local_path: Path) -> None:
-        """Drive 파일을 로컬 경로에 다운로드한다."""
+    def download(self, drive_file_id: str, local_path: Path) -> dict:
+        """Drive 파일을 로컬 경로에 다운로드한다.
+
+        반환값: 파일 메타데이터 dict (md5Checksum, appProperties 등).
+        """
         local_path.parent.mkdir(parents=True, exist_ok=True)
 
         request = self._service.files().get_media(fileId=drive_file_id)
@@ -257,10 +272,17 @@ class DriveClient:
             not_found_file_id=drive_file_id,
         )
         local_path.write_bytes(content)
-        logger.info(f"Drive 다운로드: {local_path}")
 
-    def delete(self, drive_file_id: str) -> None:
-        """Drive 파일을 휴지통으로 이동한다 (소프트 삭제).
+        # get_media는 바이너리만 반환하므로 메타데이터는 별도 조회
+        meta = self.get_file_metadata(
+            drive_file_id,
+            fields="id,md5Checksum,appProperties",
+        )
+        logger.info(f"Drive 다운로드: {local_path}")
+        return meta
+
+    def hard_delete(self, drive_file_id: str) -> None:
+        """Drive 파일을 휴지통으로 이동한다 (convergence 후 최종 삭제용).
 
         참고: trashed=True는 Changes API에서 removed=True가 아니라
         file.trashed=True로 감지된다. get_changes()에서 양쪽 모두 처리한다.
@@ -270,10 +292,68 @@ class DriveClient:
         )
         _execute_with_retry(
             request,
-            description=f"delete[{drive_file_id}]",
+            description=f"hard_delete[{drive_file_id}]",
             not_found_file_id=drive_file_id,
         )
-        logger.info(f"Drive 휴지통 이동: {drive_file_id}")
+        logger.info(f"Drive 휴지통 이동 (hard_delete): {drive_file_id}")
+
+    def move_to_tombstones(
+        self,
+        drive_file_id: str,
+        app_properties: dict[str, str] | None = None,
+    ) -> None:
+        """Drive 파일을 .sync/tombstones/ 폴더로 이동한다 (논리 삭제).
+
+        parents를 tombstones 폴더로 변경하고,
+        appProperties에 deleted=1을 설정한다.
+        """
+        tombstones_id = self.ensure_tombstones_folder()
+
+        # 현재 parents 조회
+        meta = (
+            self._service.files()
+            .get(fileId=drive_file_id, fields="parents")
+            .execute()
+        )
+        old_parents = ",".join(meta.get("parents", []))
+
+        body: dict[str, Any] = {}
+        if app_properties:
+            body["appProperties"] = app_properties
+
+        request = self._service.files().update(
+            fileId=drive_file_id,
+            addParents=tombstones_id,
+            removeParents=old_parents,
+            body=body,
+            fields="id,parents,appProperties",
+        )
+        _execute_with_retry(
+            request,
+            description=f"move_to_tombstones[{drive_file_id}]",
+            not_found_file_id=drive_file_id,
+        )
+        logger.info(f"Drive tombstone 이동: {drive_file_id}")
+
+    def ensure_tombstones_folder(self) -> str:
+        """`.sync/tombstones/` 폴더 ID를 반환한다. 없으면 생성.
+
+        세션 내 캐시하여 중복 생성을 방지한다.
+        """
+        if self._tombstones_folder_id is not None:
+            return self._tombstones_folder_id
+
+        # .sync 폴더 확보
+        sync_folder_id = self.ensure_folder_path(".sync")
+
+        # tombstones 하위 폴더 확인/생성
+        tombstones_id = self.find_folder("tombstones", sync_folder_id)
+        if not tombstones_id:
+            tombstones_id = self.create_folder("tombstones", sync_folder_id)
+            logger.info(f"Drive .sync/tombstones/ 폴더 생성: {tombstones_id}")
+
+        self._tombstones_folder_id = tombstones_id
+        return tombstones_id
 
     def rename(self, drive_file_id: str, new_name: str) -> None:
         """Drive 파일의 이름을 변경한다."""
@@ -433,7 +513,7 @@ class DriveClient:
                     "nextPageToken,newStartPageToken,"
                     "changes(fileId,removed,"
                     "file(id,name,mimeType,modifiedTime,parents,trashed,"
-                    "size,md5Checksum))"
+                    "size,md5Checksum,appProperties))"
                 ),
                 includeRemoved=True,
                 pageSize=100,
@@ -493,8 +573,14 @@ class DriveClient:
             self._vault_folder_ids.add(file_id)
             return None
 
-        # 삭제 판정: removed=True OR trashed=True
-        is_deleted = removed or is_trashed
+        # tombstones 폴더로의 move 감지
+        is_in_tombstones = (
+            self._tombstones_folder_id is not None
+            and self._tombstones_folder_id in parents
+        )
+
+        # 삭제 판정: removed=True OR trashed=True OR tombstones 폴더 이동
+        is_deleted = removed or is_trashed or is_in_tombstones
 
         # 소비자(sync engine) 용 정규화된 스키마
         # Google Docs(.gdoc 등)는 md5Checksum이 없어 None이 될 수 있다.
@@ -512,6 +598,8 @@ class DriveClient:
             "file_id": file_id,
             "removed": is_deleted,
             "file": file_payload,
+            "app_properties": file_meta.get("appProperties"),
+            "parents": parents,
         }
 
     def _is_in_vault(self, file_id: str, parents: list[str]) -> bool:
@@ -616,7 +704,7 @@ class DriveClient:
                     self._service.files()
                     .list(
                         q=q,
-                        fields="nextPageToken,files(id,name,mimeType,modifiedTime,size,parents)",
+                        fields="nextPageToken,files(id,name,mimeType,modifiedTime,size,parents,md5Checksum,appProperties)",
                         pageSize=100,
                         pageToken=page_token,
                     )
