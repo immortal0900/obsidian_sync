@@ -267,10 +267,38 @@ class SyncEngine:
         existing = self._state.files.get(path)
         existing_id = existing.drive_id if existing else None
         old_version = existing.version if existing else VersionVector.empty()
-        new_version = old_version.update(self._state.device_id)
 
         # Compute local md5
         local_md5 = compute_md5(local_abs)
+
+        # Echo guard: state에 이미 동일 md5+size로 기록돼 있으면
+        # 이는 우리가 방금 download/upload한 파일의 watcher 반향이므로 skip.
+        if existing is not None and existing.md5 is not None \
+                and existing.md5 == local_md5 \
+                and existing.size == local_abs.stat().st_size \
+                and not existing.deleted:
+            logger.debug(f"echo 억제 (md5 동일): {path}")
+            return
+
+        # Defensive: existing_id가 없는데 Drive에 같은 경로 파일이 있으면
+        # 중복 생성 방지를 위해 그 drive_id를 재사용 (PR4 후속 핫픽스).
+        if existing_id is None:
+            try:
+                found_id = self._drive.find_file_by_rel_path(path)
+            except Exception:
+                logger.warning(
+                    f"Drive 중복 조회 실패 — 새 파일로 업로드 계속: {path}",
+                    exc_info=True,
+                )
+                found_id = None
+            if found_id is not None:
+                logger.info(
+                    f"중복 생성 방지: Drive에 기존 파일 발견 → 재사용 "
+                    f"(path={path}, drive_id={found_id})"
+                )
+                existing_id = found_id
+
+        new_version = old_version.update(self._state.device_id)
 
         # appProperties에 version vector 인코딩
         app_props = vv_encode(new_version, deleted=False, md5=local_md5)

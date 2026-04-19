@@ -54,6 +54,7 @@ def state(config: SyncConfig) -> SyncState:
 def drive() -> MagicMock:
     mock = MagicMock()
     mock.upload.return_value = {"id": "drive_id_new", "md5Checksum": "drive_md5_hash"}
+    mock.find_file_by_rel_path.return_value = None  # 기본: Drive에 중복 없음
     return mock
 
 

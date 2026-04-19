@@ -593,6 +593,51 @@ class DriveClient:
 
         return parent_id
 
+    def find_folder_path(self, rel_folder_path: str) -> str | None:
+        """상대 경로의 폴더 ID를 조회. 존재하지 않으면 None (생성하지 않음)."""
+        if not rel_folder_path or rel_folder_path == ".":
+            return self._folder_id
+
+        cached = self._folder_cache.get(rel_folder_path)
+        if cached:
+            return cached
+
+        parent_id = self._folder_id
+        for part in rel_folder_path.split("/"):
+            child = self.find_folder(part, parent_id)
+            if child is None:
+                return None
+            parent_id = child
+        self._folder_cache[rel_folder_path] = parent_id
+        return parent_id
+
+    def find_file_by_rel_path(self, rel_path: str) -> str | None:
+        """상대 경로의 파일 ID를 조회. 없으면 None.
+
+        Upload 직전 중복 생성 방지용 — state에 drive_id가 없을 때
+        Drive에 이미 같은 경로 파일이 있는지 확인하여 재사용한다.
+        """
+        if "/" in rel_path:
+            parent_rel, name = rel_path.rsplit("/", 1)
+        else:
+            parent_rel, name = "", rel_path
+
+        parent_id = self.find_folder_path(parent_rel)
+        if parent_id is None:
+            return None
+
+        safe_name = name.replace("'", "\\'")
+        q = (
+            f"name='{safe_name}' and '{parent_id}' in parents "
+            f"and mimeType!='{MIME_FOLDER}' and trashed=false"
+        )
+        request = self._service.files().list(q=q, fields="files(id)", pageSize=1)
+        resp = _execute_with_retry(
+            request, description=f"find_file_by_rel_path[{rel_path}]"
+        )
+        files = resp.get("files", [])
+        return files[0]["id"] if files else None
+
     # ── 변경 감지 ─────────────────────────────────────────────────────────
 
     def get_initial_token(self) -> str:
