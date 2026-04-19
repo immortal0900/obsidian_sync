@@ -333,6 +333,27 @@ class SyncEngine:
         path: str = action["path"]
         local_abs: Path = self._state.vault_path / path
 
+        # 편집 중 보호 가드 (v2 핫픽스): download 직전 로컬 파일이 state에
+        # 저장된 md5와 달라졌다면 사용자가 그 사이 편집 중일 가능성.
+        # 그대로 덮어쓰면 사용자 수정본이 유실되므로 conflict 사본으로 보존.
+        if local_abs.exists():
+            state_entry = self._state.files.get(path)
+            if state_entry is not None and state_entry.md5 is not None:
+                current_local_md5 = compute_md5(local_abs)
+                if current_local_md5 and current_local_md5 != state_entry.md5:
+                    logger.warning(
+                        f"download 직전 로컬 수정 감지 — 충돌 사본으로 보존 후 진행: {path}"
+                    )
+                    try:
+                        self._conflict.resolve(
+                            path,
+                            local_info={"md5": current_local_md5},
+                            remote_info={"file_id": file_id},
+                        )
+                    except Exception:
+                        logger.exception(f"충돌 사본 생성 실패 — download 중단: {path}")
+                        return
+
         self._mark_local_written(path)
         meta = self._drive.download(file_id, local_abs)
 
@@ -511,6 +532,24 @@ class SyncEngine:
         if existing_path is not None:
             if should_ignore(existing_path):
                 return None
+
+            # md5 에코 가드 (v2 핫픽스): Drive가 통보한 변경의 md5가 state에
+            # 저장된 md5와 동일하면 이는 우리가 방금 올린 파일의 Changes API
+            # 지각 보고. 그대로 download하면 사용자가 방금 편집한 로컬본을
+            # 덮어쓰게 되어 "내용이 이전으로 돌아감" 회귀 발생.
+            remote_md5 = file_meta.get("md5Checksum") or file_meta.get("md5")
+            state_entry = self._state.files.get(existing_path)
+            if (
+                state_entry is not None
+                and state_entry.md5 is not None
+                and remote_md5
+                and state_entry.md5 == remote_md5
+            ):
+                logger.debug(
+                    f"echo 억제 (remote md5 == state md5): {existing_path}"
+                )
+                return None
+
             # 이미 알고 있는 파일 → 재다운로드
             return {
                 "type": ACTION_DOWNLOAD,
