@@ -333,26 +333,73 @@ class SyncEngine:
         path: str = action["path"]
         local_abs: Path = self._state.vault_path / path
 
-        # 편집 중 보호 가드 (v2 핫픽스): download 직전 로컬 파일이 state에
-        # 저장된 md5와 달라졌다면 사용자가 그 사이 편집 중일 가능성.
-        # 그대로 덮어쓰면 사용자 수정본이 유실되므로 conflict 사본으로 보존.
+        # 3-way md5 비교 가드 (v2 핫픽스):
+        # 로컬 md5(L) / state md5(S) / Drive md5(D) 3개를 비교해 과잉 conflict 방지.
+        #   L==S==D            -> 셋 다 같음, download 불필요 → skip
+        #   L==S, S!=D         -> Drive만 갱신 → 정상 download
+        #   L!=S, L==D         -> 로컬=Drive (외부 자동저장 후 state만 오래됨)
+        #                         → download 불필요, state의 version/md5만 갱신
+        #   L!=S, L!=D         -> 진짜 동시 편집 → conflict 사본 + download
         if local_abs.exists():
             state_entry = self._state.files.get(path)
-            if state_entry is not None and state_entry.md5 is not None:
-                current_local_md5 = compute_md5(local_abs)
-                if current_local_md5 and current_local_md5 != state_entry.md5:
+            current_local_md5 = compute_md5(local_abs)
+
+            remote_md5: str | None = None
+            try:
+                meta_pre = self._drive.get_file_metadata(
+                    file_id, fields="md5Checksum"
+                )
+                remote_md5 = (
+                    meta_pre.get("md5Checksum") if isinstance(meta_pre, dict) else None
+                )
+            except Exception:
+                logger.warning(
+                    f"download 전 Drive md5 조회 실패 — 가드 비활성화, 정상 download 진행: {path}"
+                )
+
+            if current_local_md5 and remote_md5:
+                state_md5 = state_entry.md5 if state_entry else None
+                local_eq_state = state_md5 is not None and current_local_md5 == state_md5
+                local_eq_remote = current_local_md5 == remote_md5
+
+                if local_eq_state and local_eq_remote:
+                    logger.debug(f"download skip (all 3 md5 equal): {path}")
+                    return
+                if not local_eq_state and local_eq_remote:
+                    # 로컬이 이미 Drive와 같음 → download 불필요. state만 최신화.
+                    logger.info(
+                        f"download skip (local == remote md5, state stale only): {path}"
+                    )
+                    if state_entry is not None:
+                        self._state.update_file(
+                            path,
+                            FileEntry(
+                                mtime=local_abs.stat().st_mtime,
+                                size=local_abs.stat().st_size,
+                                drive_id=state_entry.drive_id or file_id,
+                                version=state_entry.version,
+                                md5=current_local_md5,
+                                deleted=False,
+                            ),
+                        )
+                    return
+                if not local_eq_state and not local_eq_remote:
+                    # 진짜 동시 편집 → 로컬본 보존 후 Drive 버전 download
                     logger.warning(
-                        f"download 직전 로컬 수정 감지 — 충돌 사본으로 보존 후 진행: {path}"
+                        f"concurrent edit detected (L!=S, L!=D) → conflict 사본 보존: {path}"
                     )
                     try:
                         self._conflict.resolve(
                             path,
                             local_info={"md5": current_local_md5},
-                            remote_info={"file_id": file_id},
+                            remote_info={"file_id": file_id, "md5": remote_md5},
                         )
                     except Exception:
-                        logger.exception(f"충돌 사본 생성 실패 — download 중단: {path}")
+                        logger.exception(
+                            f"충돌 사본 생성 실패 — download 중단: {path}"
+                        )
                         return
+                # L==S, S!=D 인 경우(Drive만 갱신) → 아래 정상 download 흐름으로 진행
 
         self._mark_local_written(path)
         meta = self._drive.download(file_id, local_abs)
