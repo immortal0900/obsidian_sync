@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 import time
-from pathlib import Path
 
 import pytest
 
@@ -58,7 +57,7 @@ class TestMove:
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         assert meta["original_path"] == "sub/doc.md"
         assert meta["mtime"] > 0
-        assert meta["size"] == len("content".encode())
+        assert meta["size"] == len(b"content")
         assert meta["deleted_at"] > 0
         assert meta["md5"] == "abc123"
 

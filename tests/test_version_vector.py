@@ -5,8 +5,6 @@ merge, trim(28) 동작을 100% 커버리지로 검증한다.
 """
 import time
 
-import pytest
-
 from src.version_vector import VectorOrdering, VersionVector
 
 
