@@ -14,6 +14,7 @@ config.yaml
 credentials.json
 credentials/
 token.json
+config_blog.yaml
 
 # Runtime files
 drive_id_cache.json
