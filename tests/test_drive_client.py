@@ -1211,3 +1211,67 @@ class TestNestedUploadIntegration:
         # _folder_cache에 foo, foo/bar 등록됨
         assert drive_client._folder_cache["foo"] == "foo_id"
         assert drive_client._folder_cache["foo/bar"] == "foo_bar_id"
+
+
+class TestConvergenceFile:
+    """`.sync/convergence.json` 읽기/쓰기 (PR4 Drive wiring)."""
+
+    def test_read_returns_empty_when_file_missing(self, drive_client):
+        """convergence.json이 없으면 ({}, '0')을 반환한다."""
+        list_req = drive_client._service.files().list.return_value
+        list_req.execute.return_value = {"files": []}
+
+        data, version = drive_client.read_convergence()
+
+        assert data == {}
+        assert version == "0"
+
+    def test_read_returns_data_and_version(self, drive_client):
+        """파일이 있으면 JSON + Drive version 필드를 돌려준다."""
+        list_req = drive_client._service.files().list.return_value
+        list_req.execute.return_value = {"files": [{"id": "conv_id"}]}
+
+        get_media_req = drive_client._service.files().get_media.return_value
+        get_media_req.execute.return_value = b'{"schema": "v1", "devices": {}}'
+
+        get_req = drive_client._service.files().get.return_value
+        get_req.execute.return_value = {"version": "42"}
+
+        data, version = drive_client.read_convergence()
+
+        assert data == {"schema": "v1", "devices": {}}
+        assert version == "42"
+        assert drive_client._convergence_file_id == "conv_id"
+
+    def test_write_creates_file_when_missing(self, drive_client):
+        """처음 write 시 파일이 없으면 새로 생성한다."""
+        list_req = drive_client._service.files().list.return_value
+        list_req.execute.return_value = {"files": []}
+
+        create_req = drive_client._service.files().create.return_value
+        # .sync 폴더 생성 + convergence.json 생성
+        create_req.execute.side_effect = [
+            {"id": "sync_folder_id"},
+            {"id": "new_conv_id"},
+        ]
+
+        update_req = drive_client._service.files().update.return_value
+        update_req.execute.return_value = {"id": "new_conv_id", "version": "1"}
+
+        ok = drive_client.write_convergence({"schema": "v1"}, expected_version="0")
+
+        assert ok is True
+        assert drive_client._convergence_file_id == "new_conv_id"
+
+    def test_write_returns_false_on_version_mismatch(self, drive_client):
+        """expected_version이 현재와 다르면 False (optimistic concurrency)."""
+        drive_client._convergence_file_id = "conv_id"
+
+        get_req = drive_client._service.files().get.return_value
+        get_req.execute.return_value = {"version": "99"}
+
+        ok = drive_client.write_convergence({}, expected_version="42")
+
+        assert ok is False
+        # update은 호출되지 않아야 함
+        drive_client._service.files().update.assert_not_called()
