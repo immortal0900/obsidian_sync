@@ -5,6 +5,8 @@
 """
 from __future__ import annotations
 
+import io
+import json
 import logging
 import time
 from collections import deque
@@ -160,6 +162,9 @@ class DriveClient:
 
         # .sync/tombstones/ 폴더 ID 캐시 (세션 내 1회 조회)
         self._tombstones_folder_id: str | None = None
+
+        # .sync/convergence.json 파일 ID 캐시 (세션 내 1회 조회/생성)
+        self._convergence_file_id: str | None = None
 
     # ── 인증 ──────────────────────────────────────────────────────────────
 
@@ -354,6 +359,120 @@ class DriveClient:
 
         self._tombstones_folder_id = tombstones_id
         return tombstones_id
+
+    # ── convergence.json (PR4: tombstone GC 합의) ──────────────────────
+
+    def _find_convergence_file(self) -> str | None:
+        """.sync/convergence.json 파일 ID를 찾는다. 없으면 None."""
+        sync_folder_id = self.ensure_folder_path(".sync")
+        query = (
+            f"'{sync_folder_id}' in parents "
+            f"and name = 'convergence.json' "
+            f"and trashed = false"
+        )
+        request = self._service.files().list(
+            q=query, fields="files(id)", pageSize=1
+        )
+        result = _execute_with_retry(request, description="find_convergence_file")
+        files = result.get("files", [])
+        return files[0]["id"] if files else None
+
+    def _ensure_convergence_file(self) -> str:
+        """.sync/convergence.json 파일 ID를 반환한다. 없으면 빈 파일 생성."""
+        if self._convergence_file_id is not None:
+            return self._convergence_file_id
+
+        file_id = self._find_convergence_file()
+        if file_id is None:
+            sync_folder_id = self.ensure_folder_path(".sync")
+            media = googleapiclient.http.MediaIoBaseUpload(
+                io.BytesIO(b"{}"), mimetype="application/json"
+            )
+            meta = {
+                "name": "convergence.json",
+                "parents": [sync_folder_id],
+                "mimeType": "application/json",
+            }
+            request = self._service.files().create(
+                body=meta, media_body=media, fields="id"
+            )
+            result = _execute_with_retry(request, description="create_convergence_file")
+            file_id = result["id"]
+            logger.info(f"Drive .sync/convergence.json 생성: {file_id}")
+
+        self._convergence_file_id = file_id
+        return file_id
+
+    def read_convergence(self) -> tuple[dict[str, Any], str]:
+        """.sync/convergence.json 을 읽어 (data, version)을 반환한다.
+
+        version은 Drive의 단조증가 `version` 필드를 optimistic etag로 사용.
+        파일이 없으면 ({}, "0") 반환 (ConvergenceManager의 첫 write가 생성).
+        """
+        file_id = self._find_convergence_file()
+        if file_id is None:
+            return {}, "0"
+        self._convergence_file_id = file_id
+
+        media_req = self._service.files().get_media(fileId=file_id)
+        content = _execute_with_retry(
+            media_req, description=f"read_convergence[{file_id}]"
+        )
+        try:
+            data = json.loads(content.decode("utf-8")) if content else {}
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            logger.warning("convergence.json 파싱 실패, 빈 상태로 처리")
+            data = {}
+
+        meta_req = self._service.files().get(fileId=file_id, fields="version")
+        meta = _execute_with_retry(
+            meta_req, description=f"read_convergence_version[{file_id}]"
+        )
+        version = str(meta.get("version", "0"))
+        return data, version
+
+    def write_convergence(
+        self, data: dict[str, Any], expected_version: str
+    ) -> bool:
+        """convergence.json 을 조건부로 덮어쓴다.
+
+        expected_version이 현재 Drive version과 일치할 때만 write.
+        Drive API v3가 If-Match 헤더를 노출하지 않으므로, write 직전
+        version을 재조회하여 optimistic concurrency를 구현한다.
+
+        반환값: 성공 시 True, 경합(expected 불일치) 시 False.
+        """
+        file_id = self._ensure_convergence_file()
+
+        # 첫 생성이 아닌 경우, 쓰기 직전 version 재확인
+        if expected_version != "0":
+            meta_req = self._service.files().get(
+                fileId=file_id, fields="version"
+            )
+            meta = _execute_with_retry(
+                meta_req, description=f"write_convergence_check[{file_id}]"
+            )
+            current_version = str(meta.get("version", "0"))
+            if current_version != expected_version:
+                logger.info(
+                    f"convergence.json etag mismatch: "
+                    f"expected={expected_version}, got={current_version}"
+                )
+                return False
+
+        body = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8")
+        media = googleapiclient.http.MediaIoBaseUpload(
+            io.BytesIO(body), mimetype="application/json"
+        )
+        request = self._service.files().update(
+            fileId=file_id, media_body=media, fields="id,version"
+        )
+        _execute_with_retry(
+            request,
+            description=f"write_convergence[{file_id}]",
+            not_found_file_id=file_id,
+        )
+        return True
 
     def rename(self, drive_file_id: str, new_name: str) -> None:
         """Drive 파일의 이름을 변경한다."""

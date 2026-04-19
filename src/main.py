@@ -55,6 +55,7 @@ class AppContext:
     watcher: LocalWatcher
     poller: AdaptivePoller
     shutdown_event: asyncio.Event
+    convergence: Any = None  # ConvergenceManager | None (선택적 — tombstone GC용)
 
 
 # ── 로깅 설정 ────────────────────────────────────────────────────────────
@@ -300,11 +301,15 @@ def build_context(
     intent_log_path = config.state_dir / "intent_log.jsonl"
     intent_log = IntentLog(intent_log_path)
 
-    # Convergence Manager (PR4) — Drive callbacks will be wired after
-    # authentication. Tombstone GC uses this to check device convergence.
-    _convergence = ConvergenceManager()  # noqa: F841
+    # Convergence Manager (PR4) — Drive가 인증되기 전에 read/write_fn을
+    # bind해도 실제 호출은 인증 후에 일어남. ConvergenceManager 내부의
+    # retry loop에서 인증 미완 예외는 WARNING 로그로 처리된다.
+    convergence = ConvergenceManager(
+        read_fn=drive.read_convergence,
+        write_fn=drive.write_convergence,
+    )
     logger.info(
-        f"ConvergenceManager initialized (tombstone_retention={config.tombstone_retention_days}d)"
+        f"ConvergenceManager wired to Drive (tombstone_retention={config.tombstone_retention_days}d)"
     )
 
     engine = SyncEngine(
@@ -328,6 +333,7 @@ def build_context(
         watcher=watcher,
         poller=poller,
         shutdown_event=shutdown_event,
+        convergence=convergence,
     )
 
 
