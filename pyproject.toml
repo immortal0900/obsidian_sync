@@ -1,7 +1,7 @@
 [project]
 name = "obsidian-sync"
-version = "0.1.0"
-description = "Bidirectional sync daemon between local Obsidian vault and Google Drive"
+version = "2.0.0"
+description = "Bidirectional sync daemon between local Obsidian vault and Google Drive (Version Vector based)"
 requires-python = ">=3.12"
 dependencies = [
     "google-api-python-client>=2.194.0",

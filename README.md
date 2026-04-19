@@ -18,8 +18,8 @@ Obsidian 볼트 (내 PC)           Google Drive (클라우드)
 
 - **로컬→Drive**: 파일 변경을 실시간 감지(`watchdog`) → 디바운싱 후 업로드
 - **Drive→로컬**: 적응형 폴링(10초~2분)으로 클라우드 변경 감지 → 다운로드
-- **충돌 시**: 양쪽 모두 보존 — `.conflict` 사본을 만들어서 내용이 절대 날아가지 않음
-- **삭제 전파**: 한쪽에서 지우면 반대쪽에서도 삭제 (설정으로 끌 수 있음)
+- **충돌 시**: 양쪽 모두 보존 — `.sync-conflict-{시각}-{기기}.{확장자}` 사본이 생성되어 내용이 절대 날아가지 않음 (Syncthing 명명 규칙 호환)
+- **삭제 전파**: Version Vector 기반 3-way 판정으로 한쪽 삭제를 안전하게 반대쪽으로 전파. 삭제된 파일은 `.sync/trash/` 또는 Drive `.sync/tombstones/` 로 이동되어 복구 가능 (기본 30일/90일 보관)
 
 ---
 
@@ -194,14 +194,25 @@ type obsidian_sync.log             # Windows
 ## 테스트
 
 ```bash
-uv run python -m pytest tests/ -v
+uv sync --extra dev                  # 개발 의존성 설치 (pytest, ruff)
+uv run python -m pytest tests/ -v    # 458 tests 실행
+uv run ruff check src/ tests/        # 정적 분석
 ```
 
-개발용 의존성이 필요합니다:
+현재 기준: **458 passed, 2 skipped, 0 failures** + `ruff check` 통과.
 
-```bash
-uv sync --extra dev
-```
+---
+
+## 아키텍처 (v2)
+
+v2.0부터 **[Syncthing BEP](https://docs.syncthing.net/specs/bep-v1.html) 스타일의 Version Vector**를 Google Drive `appProperties` 위에 얹어, mtime 의존 없이 **결정적 3-way 동기화**를 수행합니다.
+
+- 파일마다 `{device_prefix → HLC counter}` 벡터가 있어 기기 간 시계 편차에 강함
+- 삭제는 실삭제가 아니라 `.sync/tombstones/` 논리 이동 → 다른 기기가 삭제 사실을 놓치지 않음
+- 오프라인 기기가 나중에 복귀해도 유령 부활 없음
+- 모든 수정(단순 저장 포함)이 vector 증분 이벤트 → 어떤 기기가 언제 수정했는지 보존
+
+상세 설계, PR 로드맵, 결정 근거는 [docs/architecture/sync-design.md](docs/architecture/sync-design.md) 참조.
 
 ---
 
@@ -209,21 +220,28 @@ uv sync --extra dev
 
 ```
 obsidian_sync/
-├── src/                          # 신규 모듈 (스펙 기반 리팩토링)
-│   ├── config.py                 #   설정 로드, 제외 패턴, 폴링 상수
-│   ├── state.py                  #   sync_state.json 관리 (load/save/scan/diff)
-│   └── drive_client.py           #   Google Drive API 래퍼 (순수 API 호출)
-├── core/                         # 현재 운영 중인 모듈
-│   ├── watcher.py                #   watchdog 감지 + 디바운스
-│   └── drive_sync.py             #   Drive API + 폴링 + 동기화 로직
-├── hooks/                        # 훅 시스템
-│   ├── __init__.py               #   훅 레지스트리
-│   └── sync_hook.py              #   파일 변경 → Drive 동기화 훅
-├── tests/                        # 단위 테스트 (80개)
-│   ├── test_config.py
-│   ├── test_state.py
-│   └── test_drive_client.py
-├── main.py                       # 데몬 진입점
+├── src/
+│   ├── config.py                 # 설정 로드, 제외 패턴, 폴링 상수
+│   ├── state.py                  # sync_state.json v2 (Version Vector + 마이그레이션)
+│   ├── drive_client.py           # Google Drive API 래퍼 (appProperties + tombstone move)
+│   ├── version_vector.py         # HLC 기반 Version Vector (compare/merge/trim)
+│   ├── drive_vv_codec.py         # VersionVector ↔ Drive appProperties 인코딩
+│   ├── reconciler.py             # 3-way 판정 엔진 (decide/resolve_conflict)
+│   ├── sync_engine.py            # 실행 엔진 (upload/download/delete/conflict)
+│   ├── trash.py                  # 로컬 .sync/trash/ flat UUID 보관
+│   ├── convergence.py            # tombstone 안전 GC 합의 프로토콜
+│   ├── intent_log.py             # 부분 실패 복구용 WAL
+│   ├── hash.py                   # 청크 md5 (내용 매칭)
+│   ├── conflict.py               # .sync-conflict-* 사본 생성
+│   ├── local_watcher.py          # watchdog 이벤트 → delete+create 분해
+│   ├── poller.py                 # Drive Changes API 적응형 폴링
+│   └── main.py                   # 진입점 + AppContext 조립 + 종료 시퀀스
+├── tests/                        # 458 tests
+├── docs/
+│   ├── architecture/sync-design.md  # v2 설계 전체 명세
+│   ├── journal.md                   # 엔지니어링 저널
+│   └── new-device-setup.md          # 새 기기 추가 절차
+├── artifacts/                    # 스프린트 계약·진행·QA 아카이브
 ├── config.example.yaml           # 설정 템플릿
 ├── SETUP_GUIDE.md                # 새 기기 설정 상세 가이드
 └── README.md
