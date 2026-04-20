@@ -605,14 +605,26 @@ class SyncEngine:
                 "reason": "remote_modified",
             }
 
-        if should_ignore(name):
+        # 새 파일: parents 체인으로 rel_path 복원.
+        # Changes API는 경로 문자열을 주지 않으므로 file.parents를 따라
+        # 볼트 루트까지 올라가며 폴더 이름을 조립한다. 실패 시(볼트 밖 등)는
+        # 루트에 떨어뜨리지 않고 무시한다.
+        parents = change.get("parents") or []
+        rel_path = self._drive.resolve_vault_rel_path(parents, name)
+        if rel_path is None:
+            logger.debug(
+                f"remote_new 경로 해석 실패(볼트 밖 또는 parents 미확인) — 무시: "
+                f"file_id={file_id}, name={name}, parents={parents}"
+            )
             return None
 
-        # 새 파일 → 루트 폴더 기준 이름으로 다운로드 (중첩 폴더는 reconciler에서 처리)
+        if should_ignore(rel_path):
+            return None
+
         return {
             "type": ACTION_DOWNLOAD,
             "file_id": file_id,
-            "path": name,
+            "path": rel_path,
             "reason": "remote_new",
         }
 

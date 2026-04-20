@@ -421,13 +421,16 @@ def test_remote_modified_known_file_triggers_download(
     assert (vault / "x.md").read_bytes() == b"new"
 
 
-def test_remote_new_file_downloads_by_name(
+def test_remote_new_file_downloads_to_resolved_subfolder(
     engine: SyncEngine, drive: MagicMock, vault: Path
 ) -> None:
+    """parents 체인으로 rel_path를 복원해 서브폴더로 다운로드한다."""
     def _download(file_id: str, local_path: Path) -> None:
+        local_path.parent.mkdir(parents=True, exist_ok=True)
         local_path.write_bytes(b"new")
 
     drive.download.side_effect = _download
+    drive.resolve_vault_rel_path.return_value = "notes/sub/new.md"
 
     engine.handle_remote_changes(
         [
@@ -435,10 +438,34 @@ def test_remote_new_file_downloads_by_name(
                 "file_id": "newid",
                 "removed": False,
                 "file": {"name": "new.md", "modified_time": "t", "md5": "m"},
+                "parents": ["folder_sub_id"],
             }
         ]
     )
-    assert (vault / "new.md").exists()
+    assert (vault / "notes" / "sub" / "new.md").exists()
+    drive.resolve_vault_rel_path.assert_called_once_with(
+        ["folder_sub_id"], "new.md"
+    )
+
+
+def test_remote_new_file_ignored_when_path_unresolved(
+    engine: SyncEngine, drive: MagicMock, vault: Path
+) -> None:
+    """parents로 볼트 내 경로를 복원하지 못하면 루트로 떨어뜨리지 않고 무시."""
+    drive.resolve_vault_rel_path.return_value = None
+
+    engine.handle_remote_changes(
+        [
+            {
+                "file_id": "newid",
+                "removed": False,
+                "file": {"name": "stray.md", "modified_time": "t", "md5": "m"},
+                "parents": ["unknown_parent"],
+            }
+        ]
+    )
+    drive.download.assert_not_called()
+    assert not (vault / "stray.md").exists()
 
 
 def test_unknown_action_type_is_logged(

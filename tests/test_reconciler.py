@@ -47,6 +47,11 @@ def drive() -> MagicMock:
     mock = MagicMock()
     mock.get_changes.return_value = ([], "tok1")
     mock.get_initial_token.return_value = "initial_token"
+    # 기본: parents 해석이 파일명을 그대로 rel_path로 돌려주도록
+    # (기존 테스트는 파일을 루트에 둔다고 가정)
+    mock.resolve_vault_rel_path.side_effect = (
+        lambda parents, name: name if name else None
+    )
     return mock
 
 

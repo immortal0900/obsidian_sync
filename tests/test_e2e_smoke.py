@@ -94,6 +94,10 @@ def _make_mock_drive(
     drive.hard_delete = MagicMock()
     drive.move_to_tombstones = MagicMock()
     drive.rename = MagicMock()
+    # 새 파일의 rel_path 해석 — 테스트에서는 파일명을 그대로 경로로 사용.
+    drive.resolve_vault_rel_path = MagicMock(
+        side_effect=lambda parents, name: name if name else None
+    )
 
     drive.list_all_files = MagicMock(return_value=list_files or [])
 

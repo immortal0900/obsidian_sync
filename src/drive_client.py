@@ -153,6 +153,10 @@ class DriveClient:
         # 재시작 시 ensure_folder_path() 호출마다 Drive API 재조회됨
         self._folder_cache: dict[str, str] = {}
 
+        # 역매핑: drive_folder_id → rel_posix_path (루트는 "")
+        # parents 기반 경로 재구성(resolve_vault_rel_path)에서 사용.
+        self._folder_id_to_rel: dict[str, str] = {config.drive_folder_id: ""}
+
         # 볼트 트리에 속하는 것으로 확인된 폴더 ID 집합 (rel_path 없이 ID만)
         # _folder_cache.values()의 상위 집합. _is_under_vault() 성공 시 등록됨.
         self._vault_folder_ids: set[str] = {config.drive_folder_id}
@@ -587,6 +591,7 @@ class DriveClient:
                 if not folder_id:
                     folder_id = self.create_folder(part, parent_id)
                 self._folder_cache[built] = folder_id
+                self._folder_id_to_rel[folder_id] = built
                 self._vault_folder_ids.add(folder_id)
 
             parent_id = folder_id
@@ -603,13 +608,113 @@ class DriveClient:
             return cached
 
         parent_id = self._folder_id
+        built = ""
         for part in rel_folder_path.split("/"):
             child = self.find_folder(part, parent_id)
             if child is None:
                 return None
+            built = f"{built}/{part}".lstrip("/")
+            self._folder_cache[built] = child
+            self._folder_id_to_rel[child] = built
+            self._vault_folder_ids.add(child)
             parent_id = child
-        self._folder_cache[rel_folder_path] = parent_id
         return parent_id
+
+    def resolve_vault_rel_path(
+        self,
+        parents: list[str] | None,
+        name: str,
+    ) -> str | None:
+        """파일의 parents 체인을 타고 볼트 루트까지 올라가 rel_path를 구성한다.
+
+        Changes API는 경로 문자열을 주지 않고 부모 폴더 ID 배열(`parents`)만
+        제공한다. 볼트 폴더 안의 파일이면 루트(self._folder_id)까지 도달하므로
+        그 경로상의 폴더 이름을 연결해 rel_path를 만든다.
+
+        반환:
+            - 볼트 루트 바로 아래면 "name"
+            - 서브폴더 안이면 "a/b/name"
+            - 볼트 밖으로 판단되거나 해석 실패 시 None
+        """
+        if not parents or not name:
+            return None
+
+        # 단일 parent 기준으로 체인 추적. Drive에서 file.parents는 보통 1개.
+        parent_id = parents[0]
+
+        # 루트에 바로 붙어 있으면 끝
+        if parent_id == self._folder_id:
+            return name
+
+        # non-vault로 확정된 폴더면 즉시 중단
+        if parent_id in self._non_vault_ids:
+            return None
+
+        # 캐시 히트: 역매핑이 알고 있는 폴더
+        cached_rel = self._folder_id_to_rel.get(parent_id)
+        if cached_rel is not None:
+            if cached_rel == "":
+                return name
+            return f"{cached_rel}/{name}"
+
+        # 캐시 미스: parents 체인을 따라 루트까지 올라가며 경로 수집
+        segments: list[str] = []
+        path_ids: list[str] = []
+        current_id = parent_id
+
+        max_depth = 32  # 무한 루프 방어
+        for _ in range(max_depth):
+            # 체인 중간에서 캐시에 이미 있는 폴더를 만남 → 거기부터 연결
+            known_rel = self._folder_id_to_rel.get(current_id)
+            if known_rel is not None:
+                rel_prefix = known_rel
+                # 수집된 segments는 아래→위 순이므로 역순으로 합친다
+                for i, seg in enumerate(reversed(segments)):
+                    rel_prefix = f"{rel_prefix}/{seg}" if rel_prefix else seg
+                    folder_id = path_ids[len(segments) - 1 - i]
+                    self._folder_cache[rel_prefix] = folder_id
+                    self._folder_id_to_rel[folder_id] = rel_prefix
+                    self._vault_folder_ids.add(folder_id)
+                return f"{rel_prefix}/{name}" if rel_prefix else name
+
+            if current_id in self._non_vault_ids:
+                # 경로 자체가 볼트 밖
+                self._non_vault_ids.update(path_ids)
+                return None
+
+            # Drive API로 폴더 메타 조회
+            try:
+                request = self._service.files().get(
+                    fileId=current_id, fields="id,name,parents"
+                )
+                meta = _execute_with_retry(
+                    request, description=f"resolve_vault_rel_path[{current_id}]"
+                )
+            except DriveFileNotFoundError:
+                self._non_vault_ids.update(path_ids + [current_id])
+                return None
+            except Exception:
+                logger.debug(
+                    f"resolve_vault_rel_path 폴더 조회 실패: {current_id}",
+                    exc_info=True,
+                )
+                return None
+
+            segments.append(meta.get("name", ""))
+            path_ids.append(current_id)
+
+            grand = meta.get("parents") or []
+            if not grand:
+                # My Drive 루트에 도달 → 볼트 밖
+                self._non_vault_ids.update(path_ids)
+                return None
+            current_id = grand[0]
+
+        # 깊이 제한 초과 → 안전 측 fallback
+        logger.warning(
+            f"resolve_vault_rel_path 깊이 제한 도달(parents={parents[0]}, name={name})"
+        )
+        return None
 
     def find_file_by_rel_path(self, rel_path: str) -> str | None:
         """상대 경로의 파일 ID를 조회. 없으면 None.
@@ -889,6 +994,7 @@ class DriveClient:
                         # 폴더 → 큐에 추가 + 캐시 등록
                         queue.append((item["id"], rel_path))
                         self._folder_cache[rel_path] = item["id"]
+                        self._folder_id_to_rel[item["id"]] = rel_path
                         self._vault_folder_ids.add(item["id"])
                     else:
                         # 파일 → 결과에 추가

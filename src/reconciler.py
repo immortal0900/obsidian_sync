@@ -598,7 +598,18 @@ class Reconciler:
                 name = file_meta.get("name")
                 if not name:
                     continue
-                remote_kinds[name] = {
+                # parents 체인으로 rel_path 복원 (Changes API 새 파일 대응)
+                parents = change.get("parents") or file_meta.get("parents") or []
+                resolved = self._drive.resolve_vault_rel_path(parents, name)
+                if resolved is None:
+                    logger.debug(
+                        f"reconciler: remote_new 경로 해석 실패 — 무시 "
+                        f"(file_id={file_id}, name={name})"
+                    )
+                    continue
+                if should_ignore(resolved):
+                    continue
+                remote_kinds[resolved] = {
                     "kind": "new",
                     "file_id": file_id,
                     "file": file_meta,
