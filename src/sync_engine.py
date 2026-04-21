@@ -143,6 +143,18 @@ class SyncEngine:
             self._run_action(action)
             while self._pending:
                 queued = self._pending.popleft()
+                # 직전 action이 upload였다면 _mark_drive_written으로 echo 캐시가
+                # 갱신되어 있다. lock 보유 중 대기하던 download가 사실은 우리가
+                # 방금 올린 것의 지연 알림인 케이스(빠른 편집 race)를 여기서 차단.
+                if (
+                    queued.get("type") == ACTION_DOWNLOAD
+                    and self._is_echo_drive(queued.get("file_id", ""))
+                ):
+                    logger.info(
+                        f"pending echo suppress: {queued.get('path')} "
+                        f"(file_id={queued.get('file_id')})"
+                    )
+                    continue
                 self._run_action(queued)
         finally:
             self._release_lock()
@@ -384,9 +396,22 @@ class SyncEngine:
                         )
                     return
                 if not local_eq_state and not local_eq_remote:
-                    # 진짜 동시 편집 → 로컬본 보존 후 Drive 버전 download
+                    # 사용자 편집 보호 가드: Drive(remote)가 state와 같다는 건
+                    # 우리가 직전에 올린 결과물이고, 그 사이 사용자가 더 편집한 상태.
+                    # 이때 download는 "사용자의 새 편집을 우리가 올린 이전 버전으로 되돌림"이
+                    # 되어 데이터 손실을 일으킨다. download skip 후 다음 watcher 사이클에서
+                    # 사용자의 새 편집을 upload하도록 둔다.
+                    if state_md5 is not None and remote_md5 == state_md5:
+                        local_mtime = local_abs.stat().st_mtime
+                        state_mtime = state_entry.mtime if state_entry else 0.0
+                        logger.info(
+                            f"download skip (remote == state, local has newer edits): "
+                            f"{path} (local_mtime={local_mtime}, state_mtime={state_mtime})"
+                        )
+                        return
+                    # 진짜 동시 편집 (D != S) → 로컬본 보존 후 Drive 버전 download
                     logger.warning(
-                        f"concurrent edit detected (L!=S, L!=D) → conflict 사본 보존: {path}"
+                        f"concurrent edit detected (L!=S, L!=D, D!=S) → conflict 사본 보존: {path}"
                     )
                     try:
                         self._conflict.resolve(

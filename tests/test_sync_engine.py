@@ -476,6 +476,90 @@ def test_unknown_action_type_is_logged(
     assert engine.lock is False
 
 
+# ── Race 보호: pending 큐 echo 억제 + 사용자 편집 보호 가드 ──────────────
+
+
+def test_pending_download_suppressed_after_upload_echo(
+    engine: SyncEngine, state: SyncState, drive: MagicMock, vault: Path
+) -> None:
+    """upload가 lock 보유 중에 큐잉된 download가 우리 echo면 _pending에서 skip.
+
+    빠른 편집 race: upload 진행 중 poller가 같은 파일의 변경 알림을 받아
+    download action을 _pending에 쌓는다. upload 완료 후 _mark_drive_written으로
+    drive_id가 echo 캐시에 등록되므로, _pending에서 꺼낼 때 echo로 인식해 skip.
+    """
+    _write(vault, "race.md", b"v1")
+    drive.upload.return_value = {"id": "race_drive_id", "md5Checksum": "md5_v1"}
+
+    # upload 실행 중 같은 drive_id의 download가 큐잉되도록 흉내낸다.
+    # state에 미리 매핑을 두어 _change_to_action이 download action을 만들게 한다.
+    state.files["race.md"] = FileEntry(
+        mtime=1.0, size=2, drive_id="race_drive_id", md5="md5_old"
+    )
+
+    upload_called = []
+    original_upload = drive.upload.side_effect
+
+    def upload_with_concurrent_change(*args, **kwargs):
+        # upload 동작 중 poller가 본 변경이라 가정하고 직접 큐에 쌓는다
+        engine._pending.append({
+            "type": ACTION_DOWNLOAD,
+            "file_id": "race_drive_id",
+            "path": "race.md",
+            "reason": "remote_modified",
+        })
+        upload_called.append(True)
+        if original_upload is not None:
+            return original_upload(*args, **kwargs)
+        return {"id": "race_drive_id", "md5Checksum": "md5_v1"}
+
+    drive.upload.side_effect = upload_with_concurrent_change
+
+    engine.execute({"type": ACTION_UPLOAD, "path": "race.md"})
+
+    assert upload_called == [True]
+    # 큐잉된 download는 echo 억제로 skip → drive.download 호출 안 됨
+    drive.download.assert_not_called()
+    assert engine.lock is False
+
+
+def test_download_skipped_when_remote_equals_state_protects_user_edits(
+    engine: SyncEngine, state: SyncState, drive: MagicMock, vault: Path
+) -> None:
+    """D==S 상황의 download는 사용자 새 편집을 덮지 않게 skip.
+
+    사용자가 V_new로 편집해 로컬 md5는 V_new인데, state.md5와 remote.md5는
+    둘 다 V_uploaded(직전에 우리가 올린 값)인 race. download하면 사용자 편집이
+    이전 버전으로 덮어써지므로, 새 가드가 download를 거부해야 한다.
+    """
+    # 디스크에 V_new (사용자가 막 편집한 최신)
+    _write(vault, "edit.md", b"v_new content")
+    # state는 우리가 직전에 올린 V_uploaded
+    local_path = vault / "edit.md"
+    state.files["edit.md"] = FileEntry(
+        mtime=1.0,  # state.mtime은 옛날
+        size=10,
+        drive_id="fid_edit",
+        md5="md5_uploaded",  # 우리가 올린 버전의 md5
+    )
+    # Drive도 우리가 직전에 올린 그대로 (D == S)
+    drive.get_file_metadata.return_value = {"md5Checksum": "md5_uploaded"}
+
+    engine.execute({
+        "type": ACTION_DOWNLOAD,
+        "file_id": "fid_edit",
+        "path": "edit.md",
+    })
+
+    # 사용자 편집 보호: drive.download는 호출되지 않음
+    drive.download.assert_not_called()
+    # 로컬 파일 내용은 그대로 V_new
+    assert local_path.read_bytes() == b"v_new content"
+    # conflict 사본도 만들어지지 않음 (skip이지 conflict 아님)
+    conflicts = list(vault.glob("*.conflict-*"))
+    assert conflicts == []
+
+
 # ── Sprint 3: 404 정리 ──────────────────────────────────────────────────
 
 
