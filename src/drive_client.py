@@ -15,6 +15,7 @@ from typing import Any
 
 import googleapiclient.discovery
 import googleapiclient.http
+from google.auth.exceptions import RefreshError
 from google.auth.transport.requests import Request
 from google.oauth2.credentials import Credentials
 from google_auth_oauthlib.flow import InstalledAppFlow
@@ -186,10 +187,24 @@ class DriveClient:
             )
 
         if not creds or not creds.valid:
+            refreshed = False
             if creds and creds.expired and creds.refresh_token:
-                creds.refresh(Request())
-                logger.info("OAuth 토큰 갱신 완료")
-            else:
+                try:
+                    creds.refresh(Request())
+                    logger.info("OAuth 토큰 갱신 완료")
+                    refreshed = True
+                except RefreshError:
+                    # refresh_token이 revoke되거나 만료된 경우 — 브라우저 재인증으로 폴백
+                    logger.warning(
+                        "OAuth refresh 실패 (토큰 revoke/만료) → 브라우저 재인증 진행"
+                    )
+                    try:
+                        self._token_file.unlink()
+                    except OSError:
+                        pass
+                    creds = None
+
+            if not refreshed:
                 if not self._credentials_file.exists():
                     raise FileNotFoundError(
                         f"credentials.json을 찾을 수 없습니다: "
