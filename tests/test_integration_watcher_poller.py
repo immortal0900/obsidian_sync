@@ -161,7 +161,7 @@ class TestScenarioB:
                 },
             }
         ]
-        drive.get_changes.return_value = (changes, "T1")
+        drive.get_changes.return_value = (changes, "T1", False)
 
         watcher = LocalWatcher(vault, engine, debounce_seconds=0.05)
         poller = AdaptivePoller(
@@ -319,7 +319,7 @@ class TestCoarseIntegrationSmoke:
         drive: MagicMock,
     ) -> None:
         state.page_token = "T0"
-        drive.get_changes.return_value = ([], "T1")
+        drive.get_changes.return_value = ([], "T1", False)
 
         watcher = LocalWatcher(vault, engine, debounce_seconds=0.05)
         poller = AdaptivePoller(

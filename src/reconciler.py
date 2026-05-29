@@ -14,7 +14,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
-from src.config import should_ignore
+from src.config import CHANGES_MAX_PAGES_PER_CALL, should_ignore
 from src.drive_client import DriveClient
 from src.drive_vv_codec import decode as vv_decode
 from src.hash import compute_md5
@@ -561,7 +561,9 @@ class Reconciler:
         if not token:
             return {}, None
 
-        changes, new_token = self._drive.get_changes(token)
+        changes, new_token, _ = self._drive.get_changes(
+            token, max_pages=CHANGES_MAX_PAGES_PER_CALL
+        )
 
         remote_kinds: dict[str, dict[str, Any]] = {}
         for change in changes:

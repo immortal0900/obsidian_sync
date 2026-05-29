@@ -768,7 +768,9 @@ class DriveClient:
         logger.info(f"Changes API 시작 토큰: {token}")
         return token
 
-    def get_changes(self, page_token: str) -> tuple[list[dict], str]:
+    def get_changes(
+        self, page_token: str, *, max_pages: int | None = None
+    ) -> tuple[list[dict], str, bool]:
         """page_token 이후의 변경 목록을 가져온다.
 
         볼트 폴더 범위 필터링:
@@ -783,11 +785,21 @@ class DriveClient:
         - mimeType=folder인 변경은 파일 목록에서 제외
         - 단, 볼트 안의 새 폴더는 _folder_cache에 등록
 
-        반환값: (변경 목록, 새 page_token)
+        점진 페이지네이션 (정체 방지):
+        - ``max_pages``가 지정되면 그 페이지 수만큼만 받고 중단한다.
+          중단 지점의 ``nextPageToken``을 반환하므로, 호출자가 이를
+          page_token으로 저장하면 다음 호출에서 이어받는다.
+        - page_token이 크게 밀려 변경이 수천 건 쌓인 경우, 한 번에
+          전부 받다가 네트워크 오류로 전체를 폐기하던 문제를 막는다.
+
+        반환값: (변경 목록, 새 page_token, has_more)
+            has_more=True → max_pages 한도로 중단, 더 받을 변경이 남음.
         """
         all_changes: list[dict] = []
         current_token = page_token
         new_token = page_token
+        pages = 0
+        has_more = False
 
         while current_token:
             request = self._service.changes().list(
@@ -803,6 +815,7 @@ class DriveClient:
                 pageSize=100,
             )
             resp = _execute_with_retry(request, description="get_changes")
+            pages += 1
 
             for change in resp.get("changes", []):
                 normalized = self._normalize_change(change)
@@ -810,13 +823,25 @@ class DriveClient:
                     all_changes.append(normalized)
 
             if "newStartPageToken" in resp:
+                # 끝까지 도달 → 다음 폴링 주기용 토큰
                 new_token = resp["newStartPageToken"]
                 current_token = None
             else:
-                current_token = resp.get("nextPageToken")
+                next_token = resp.get("nextPageToken")
+                if max_pages is not None and pages >= max_pages and next_token:
+                    # 페이지 한도 도달 → 진행분의 토큰을 저장하고 중단.
+                    # nextPageToken은 다음 list 호출의 pageToken으로 유효하다.
+                    new_token = next_token
+                    has_more = True
+                    current_token = None
+                else:
+                    current_token = next_token
 
-        logger.debug(f"Changes API: {len(all_changes)}개 변경 감지")
-        return all_changes, new_token
+        logger.debug(
+            f"Changes API: {len(all_changes)}개 변경 감지 "
+            f"(pages={pages}, has_more={has_more})"
+        )
+        return all_changes, new_token, has_more
 
     def _normalize_change(self, change: dict) -> dict | None:
         """Drive 변경 하나를 정규화한다.

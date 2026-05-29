@@ -60,6 +60,13 @@ POLL_MAX_INTERVAL: int = 120      # 조용할 때 최대 2분
 POLL_START_INTERVAL: int = 30     # 시작 간격 30초
 POLL_BACKOFF_FACTOR: float = 1.5  # 변경 없으면 간격 1.5배
 
+# ── Changes API 점진 페이지네이션 (정체 방지) ───────────────────────────
+# page_token이 크게 밀리면 변경이 수천 건 쌓인다. 한 번에 전부 받다가
+# 네트워크 오류로 전체를 폐기하면 토큰이 전진하지 못해 영구 정체에 빠진다.
+# 호출당 페이지 수를 제한해 받은 만큼 토큰을 전진시키고 다음 폴링에서 이어받는다.
+CHANGES_MAX_PAGES_PER_CALL: int = 10   # 호출당 최대 페이지(=pageSize 100 → 최대 1000건)
+POLL_MAX_CONSECUTIVE_FAILURES: int = 5  # 연속 폴링 실패 시 전체 재대조 폴백 트리거
+
 # ── 상태 저장 디바운스 ────────────────────────────────────────────────────
 
 STATE_SAVE_DEBOUNCE_SECONDS: float = 5.0

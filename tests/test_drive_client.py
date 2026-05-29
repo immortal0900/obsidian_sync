@@ -265,7 +265,7 @@ class TestTombstonesChangeDetection:
             ],
         }
 
-        changes, _ = drive_client.get_changes("T1")
+        changes, _, _ = drive_client.get_changes("T1")
         assert len(changes) == 1
         assert changes[0]["removed"] is True
         assert changes[0]["file"] is None  # deleted → file payload is None
@@ -294,7 +294,7 @@ class TestTombstonesChangeDetection:
             ],
         }
 
-        changes, _ = drive_client.get_changes("T1")
+        changes, _, _ = drive_client.get_changes("T1")
         assert len(changes) == 1
         assert changes[0]["removed"] is False
 
@@ -386,7 +386,7 @@ class TestGetChanges:
             ],
         }
 
-        changes, new_token = drive_client.get_changes("old_token_123")
+        changes, new_token, _ = drive_client.get_changes("old_token_123")
         assert new_token == "new_token_456"
         assert len(changes) == 1
         assert changes[0]["file_id"] == "file1"
@@ -413,7 +413,7 @@ class TestGetChanges:
             ],
         }
 
-        changes, _ = drive_client.get_changes("token1")
+        changes, _, _ = drive_client.get_changes("token1")
         assert len(changes) == 1
         assert changes[0]["removed"] is True
         assert changes[0]["file"] is None
@@ -438,7 +438,7 @@ class TestGetChanges:
             ],
         }
 
-        changes, _ = drive_client.get_changes("token1")
+        changes, _, _ = drive_client.get_changes("token1")
         assert len(changes) == 0
 
     def test_changes_outside_vault_excluded(self, drive_client):
@@ -465,7 +465,7 @@ class TestGetChanges:
             ],
         }
 
-        changes, _ = drive_client.get_changes("token1")
+        changes, _, _ = drive_client.get_changes("token1")
         assert len(changes) == 0
 
     def test_multi_page_changes(self, drive_client):
@@ -517,7 +517,7 @@ class TestGetChanges:
 
         drive_client._service.changes().list.return_value.execute = mock_list_execute
 
-        changes, new_token = drive_client.get_changes("start_token")
+        changes, new_token, _ = drive_client.get_changes("start_token")
         assert len(changes) == 2
         assert new_token == "final_token"
         assert changes[0]["file_id"] == "f1"
@@ -534,7 +534,7 @@ class TestGetChanges:
             ],
         }
 
-        changes, _ = drive_client.get_changes("token1")
+        changes, _, _ = drive_client.get_changes("token1")
         assert len(changes) == 1
         assert changes[0]["removed"] is True
         assert changes[0]["file"] is None
@@ -548,7 +548,7 @@ class TestGetChanges:
             ],
         }
 
-        changes, _ = drive_client.get_changes("token1")
+        changes, _, _ = drive_client.get_changes("token1")
         assert len(changes) == 0
 
     def test_new_vault_folder_registered(self, drive_client):
@@ -571,7 +571,7 @@ class TestGetChanges:
             ],
         }
 
-        changes, _ = drive_client.get_changes("token1")
+        changes, _, _ = drive_client.get_changes("token1")
         # 폴더 변경은 파일 목록에서 제외
         assert len(changes) == 0
         # 하지만 _vault_folder_ids에는 등록됨
@@ -909,7 +909,7 @@ class TestGetChangesErrorHandling:
         ]
 
         with patch("src.drive_client.time.sleep") as mock_sleep:
-            changes, new_token = drive_client.get_changes("old_token")
+            changes, new_token, _ = drive_client.get_changes("old_token")
 
         assert new_token == "new_token"
         assert changes == []
@@ -942,7 +942,7 @@ class TestGetChangesSchemaNormalization:
             ],
         }
 
-        changes, _ = drive_client.get_changes("t")
+        changes, _, _ = drive_client.get_changes("t")
         payload = changes[0]["file"]
         assert payload is not None
         assert payload["name"] == "note.md"
@@ -970,7 +970,7 @@ class TestGetChangesSchemaNormalization:
             ],
         }
 
-        changes, _ = drive_client.get_changes("t")
+        changes, _, _ = drive_client.get_changes("t")
         assert changes[0]["file"]["md5"] is None
 
 

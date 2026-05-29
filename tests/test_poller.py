@@ -12,7 +12,12 @@ from unittest.mock import MagicMock
 import pytest
 from googleapiclient.errors import HttpError
 
-from src.config import POLL_MAX_INTERVAL, POLL_MIN_INTERVAL, POLL_START_INTERVAL
+from src.config import (
+    POLL_MAX_CONSECUTIVE_FAILURES,
+    POLL_MAX_INTERVAL,
+    POLL_MIN_INTERVAL,
+    POLL_START_INTERVAL,
+)
 from src.drive_client import TokenInvalidError
 from src.poller import AdaptivePoller
 
@@ -63,7 +68,7 @@ def make_drive(get_changes_result: object) -> MagicMock:
 class TestInitialState:
     def test_initial_interval_is_start(self) -> None:
         poller = AdaptivePoller(
-            drive_client=make_drive(([], "T1")),
+            drive_client=make_drive(([], "T1", False)),
             sync_engine=make_engine(),
             local_watcher=make_watcher(),
             state=make_state(),
@@ -72,7 +77,7 @@ class TestInitialState:
 
     def test_token_invalid_signal_default_false(self) -> None:
         poller = AdaptivePoller(
-            drive_client=make_drive(([], "T1")),
+            drive_client=make_drive(([], "T1", False)),
             sync_engine=make_engine(),
             local_watcher=make_watcher(),
             state=make_state(),
@@ -85,7 +90,7 @@ class TestInitialState:
 
 class TestBackoff:
     async def test_three_empty_polls_increase_by_factor_with_cap(self) -> None:
-        drive = make_drive(([], "T1"))
+        drive = make_drive(([], "T1", False))
         poller = AdaptivePoller(
             drive_client=drive,
             sync_engine=make_engine(),
@@ -108,15 +113,15 @@ class TestBackoff:
     async def test_changes_reset_to_min(self) -> None:
         drive = make_drive(
             [
-                ([], "T1"),
-                ([{"file_id": "A", "removed": False, "file": {"name": "a.md"}}], "T2"),
+                ([], "T1", False),
+                ([{"file_id": "A", "removed": False, "file": {"name": "a.md"}}], "T2", False),
             ]
         )
         # side_effect with list
         drive.get_changes = MagicMock(
             side_effect=[
-                ([], "T1"),
-                ([{"file_id": "A", "removed": False, "file": {"name": "a.md"}}], "T2"),
+                ([], "T1", False),
+                ([{"file_id": "A", "removed": False, "file": {"name": "a.md"}}], "T2", False),
             ]
         )
         poller = AdaptivePoller(
@@ -132,7 +137,7 @@ class TestBackoff:
         assert poller.current_interval == POLL_MIN_INTERVAL
 
     async def test_local_active_pins_to_start_interval(self) -> None:
-        drive = make_drive(([], "T1"))
+        drive = make_drive(([], "T1", False))
         watcher = make_watcher(last_event_age=30.0)
         poller = AdaptivePoller(
             drive_client=drive,
@@ -157,7 +162,7 @@ class TestBackoff:
         assert poller.current_interval == POLL_MAX_INTERVAL
 
     async def test_interval_bounded_entire_run(self) -> None:
-        drive = make_drive(([], "T1"))
+        drive = make_drive(([], "T1", False))
         poller = AdaptivePoller(
             drive_client=drive,
             sync_engine=make_engine(),
@@ -174,7 +179,7 @@ class TestBackoff:
 
 class TestStateUpdate:
     async def test_page_token_updated_on_success(self) -> None:
-        drive = make_drive(([], "NEW_TOKEN"))
+        drive = make_drive(([], "NEW_TOKEN", False))
         state = make_state("OLD_TOKEN")
         poller = AdaptivePoller(
             drive_client=drive,
@@ -187,7 +192,7 @@ class TestStateUpdate:
 
     async def test_handle_remote_changes_called_when_nonempty(self) -> None:
         changes = [{"file_id": "X", "removed": False, "file": {"name": "x.md"}}]
-        drive = make_drive((changes, "T1"))
+        drive = make_drive((changes, "T1", False))
         engine = make_engine()
         poller = AdaptivePoller(
             drive_client=drive,
@@ -199,7 +204,7 @@ class TestStateUpdate:
         engine.handle_remote_changes.assert_called_once_with(changes)
 
     async def test_handle_remote_not_called_when_empty(self) -> None:
-        drive = make_drive(([], "T1"))
+        drive = make_drive(([], "T1", False))
         engine = make_engine()
         poller = AdaptivePoller(
             drive_client=drive,
@@ -211,7 +216,7 @@ class TestStateUpdate:
         engine.handle_remote_changes.assert_not_called()
 
     async def test_missing_page_token_skips_poll(self) -> None:
-        drive = make_drive(([], "T1"))
+        drive = make_drive(([], "T1", False))
         poller = AdaptivePoller(
             drive_client=drive,
             sync_engine=make_engine(),
@@ -304,7 +309,7 @@ class TestErrorHandling:
 
     async def test_engine_exception_does_not_exit_loop(self) -> None:
         changes = [{"file_id": "X", "removed": False, "file": {"name": "x.md"}}]
-        drive = make_drive((changes, "T1"))
+        drive = make_drive((changes, "T1", False))
         engine = make_engine()
         engine.handle_remote_changes = MagicMock(side_effect=RuntimeError("engine boom"))
         poller = AdaptivePoller(
@@ -318,7 +323,7 @@ class TestErrorHandling:
 
     async def test_engine_token_invalid_raises_signal(self) -> None:
         changes = [{"file_id": "X", "removed": False, "file": {"name": "x.md"}}]
-        drive = make_drive((changes, "T1"))
+        drive = make_drive((changes, "T1", False))
         engine = make_engine()
         engine.handle_remote_changes = MagicMock(side_effect=TokenInvalidError("x"))
         poller = AdaptivePoller(
@@ -336,7 +341,7 @@ class TestErrorHandling:
 
 class TestRunStop:
     async def test_run_exits_on_stop(self) -> None:
-        drive = make_drive(([], "T1"))
+        drive = make_drive(([], "T1", False))
         poller = AdaptivePoller(
             drive_client=drive,
             sync_engine=make_engine(),
@@ -358,7 +363,7 @@ class TestRunStop:
         assert drive.get_changes.call_count >= 1
 
     async def test_run_exits_on_cancel(self) -> None:
-        drive = make_drive(([], "T1"))
+        drive = make_drive(([], "T1", False))
         poller = AdaptivePoller(
             drive_client=drive,
             sync_engine=make_engine(),
@@ -373,3 +378,95 @@ class TestRunStop:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
+
+
+# ── 점진 페이지네이션 (has_more) ─────────────────────────────────────────
+
+
+class TestIncrementalPagination:
+    async def test_has_more_pins_to_min_and_returns_true(self) -> None:
+        """has_more=True면 다음 폴링을 최소 간격으로 당기고 True를 반환한다."""
+        drive = make_drive(([], "T_mid", True))
+        poller = AdaptivePoller(
+            drive_client=drive,
+            sync_engine=make_engine(),
+            local_watcher=make_watcher(9999.0),
+            state=make_state(),
+        )
+        result = await poller.poll_once()
+        assert poller.current_interval == POLL_MIN_INTERVAL
+        assert result is True
+
+    async def test_has_more_advances_page_token(self) -> None:
+        """변경이 비어도 has_more 중간 토큰으로 page_token이 전진한다."""
+        drive = make_drive(([], "T_mid", True))
+        state = make_state("T_old")
+        poller = AdaptivePoller(
+            drive_client=drive,
+            sync_engine=make_engine(),
+            local_watcher=make_watcher(),
+            state=state,
+        )
+        await poller.poll_once()
+        assert state.page_token == "T_mid"
+
+    async def test_max_pages_passed_to_get_changes(self) -> None:
+        """get_changes 호출 시 max_pages 한도가 전달된다."""
+        drive = make_drive(([], "T1", False))
+        poller = AdaptivePoller(
+            drive_client=drive,
+            sync_engine=make_engine(),
+            local_watcher=make_watcher(),
+            state=make_state(),
+        )
+        await poller.poll_once()
+        _, kwargs = drive.get_changes.call_args
+        assert kwargs.get("max_pages") is not None
+
+
+# ── 연속 실패 폴백 ───────────────────────────────────────────────────────
+
+
+class TestConsecutiveFailureFallback:
+    async def test_consecutive_failures_trigger_fallback(self) -> None:
+        """연속 임계 회수 실패 시 on_token_invalid(전체 재대조)를 호출한다."""
+        callback = MagicMock()
+
+        async def on_token_invalid() -> None:
+            callback()
+
+        drive = make_drive(OSError("network down"))
+        poller = AdaptivePoller(
+            drive_client=drive,
+            sync_engine=make_engine(),
+            local_watcher=make_watcher(),
+            state=make_state(),
+            on_token_invalid=on_token_invalid,
+        )
+        for _ in range(POLL_MAX_CONSECUTIVE_FAILURES):
+            await poller.poll_once()
+        callback.assert_called_once()
+
+    async def test_success_resets_failure_counter(self) -> None:
+        """중간에 성공하면 실패 카운터가 리셋되어 폴백이 트리거되지 않는다."""
+        callback = MagicMock()
+
+        async def on_token_invalid() -> None:
+            callback()
+
+        # 실패 N-1회 → 성공 1회 → 다시 실패 1회: 연속 임계에 도달하지 않음
+        responses: list[object] = [OSError("x")] * (POLL_MAX_CONSECUTIVE_FAILURES - 1)
+        responses.append(([], "T1", False))
+        responses.append(OSError("x"))
+        drive = MagicMock()
+        drive.get_changes = MagicMock(side_effect=responses)
+        poller = AdaptivePoller(
+            drive_client=drive,
+            sync_engine=make_engine(),
+            local_watcher=make_watcher(),
+            state=make_state(),
+            on_token_invalid=on_token_invalid,
+        )
+        for _ in range(len(responses)):
+            await poller.poll_once()
+        callback.assert_not_called()

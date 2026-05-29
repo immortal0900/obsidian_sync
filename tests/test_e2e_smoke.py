@@ -54,7 +54,7 @@ def config(vault: Path) -> SyncConfig:
 def _make_mock_drive(
     *,
     list_files: list[dict] | None = None,
-    get_changes_result: object = ([], "T_new"),
+    get_changes_result: object = ([], "T_new", False),
     initial_token: str = "T_init",
 ) -> MagicMock:
     """mock DriveClient 팩토리.
@@ -241,7 +241,7 @@ class TestScenarioWarmStart:
         (vault / "new.md").write_text("local content", encoding="utf-8")
 
         # Drive는 changes 없음 (빈 응답)
-        drive = _make_mock_drive(get_changes_result=([], "T1"))
+        drive = _make_mock_drive(get_changes_result=([], "T1", False))
 
         ctx, _ = _build_context_with_mock_drive(config, drive)
         exit_code = await _run_and_shutdown(ctx, after=0.2)
@@ -273,7 +273,7 @@ class TestScenarioCrossEvents:
         )
 
         # 첫 get_changes는 빈 응답 → 기동 완료
-        drive = _make_mock_drive(get_changes_result=([], "T1"))
+        drive = _make_mock_drive(get_changes_result=([], "T1", False))
 
         ctx, _ = _build_context_with_mock_drive(config, drive)
 
@@ -348,10 +348,10 @@ class TestScenarioTokenInvalid:
         # → run_without_state 재진입 경로가 TokenRefreshCoordinator를 통해 호출됨
         call_count = {"n": 0}
 
-        def _get_changes(token: str) -> tuple[list, str]:
+        def _get_changes(token: str, *, max_pages: int | None = None) -> tuple[list, str, bool]:
             call_count["n"] += 1
             if call_count["n"] == 1:
-                return [], "T_updated"
+                return [], "T_updated", False
             raise TokenInvalidError("410")
 
         remote_files = [

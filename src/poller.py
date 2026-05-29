@@ -13,7 +13,9 @@ from typing import TYPE_CHECKING, Any
 from googleapiclient.errors import HttpError
 
 from src.config import (
+    CHANGES_MAX_PAGES_PER_CALL,
     POLL_BACKOFF_FACTOR,
+    POLL_MAX_CONSECUTIVE_FAILURES,
     POLL_MAX_INTERVAL,
     POLL_MIN_INTERVAL,
     POLL_START_INTERVAL,
@@ -60,6 +62,11 @@ class AdaptivePoller:
         self._stop_event: asyncio.Event | None = None
         self._token_invalid_signal = False
 
+        # 연속 폴링 실패 카운터 — 임계 도달 시 전체 재대조 폴백을 트리거한다.
+        # page_token이 크게 밀린 상태에서 네트워크 오류가 반복돼 토큰이
+        # 전진하지 못하는 정체를 자가 치유하기 위한 안전망.
+        self._consecutive_failures = 0
+
     # ── 프로퍼티 ─────────────────────────────────────────────────────────
 
     @property
@@ -83,10 +90,13 @@ class AdaptivePoller:
             return False
 
         try:
-            changes, new_token = self._drive.get_changes(page_token)
+            changes, new_token, has_more = self._drive.get_changes(
+                page_token, max_pages=CHANGES_MAX_PAGES_PER_CALL
+            )
         except TokenInvalidError:
             logger.warning("poller: page_token 무효 — 재발급 신호")
             self._token_invalid_signal = True
+            self._consecutive_failures = 0  # 토큰 재발급 경로가 직접 복구
             if self._on_token_invalid is not None:
                 await self._invoke_token_invalid()
             # 루프는 탈출하지 않는다. 간격은 그대로 유지.
@@ -97,12 +107,18 @@ class AdaptivePoller:
                 self._current_interval = float(POLL_MAX_INTERVAL)
                 return False
             logger.exception("poller: get_changes HTTP 오류")
+            await self._note_failure()
             return False
         except (OSError, TimeoutError):
             logger.exception("poller: 네트워크 오류")
+            await self._note_failure()
             return False
 
-        # 토큰 갱신
+        # 여기 도달 = get_changes 성공 → 실패 카운터 리셋
+        self._consecutive_failures = 0
+
+        # 토큰 갱신 (점진 페이지네이션: has_more여도 받은 만큼 토큰을 전진시켜
+        # 다음 폴링에서 이어받는다. 네트워크 오류로 전체를 폐기하던 정체를 방지.)
         if new_token:
             self._state.page_token = new_token
 
@@ -119,8 +135,29 @@ class AdaptivePoller:
             except Exception:
                 logger.exception("poller: handle_remote_changes 실패")
 
-        self._update_interval(found_changes=bool(changes))
-        return bool(changes)
+        # has_more면 남은 페이지를 빨리 이어받도록 최소 간격으로 당긴다.
+        if has_more:
+            self._current_interval = float(POLL_MIN_INTERVAL)
+        else:
+            self._update_interval(found_changes=bool(changes))
+        return bool(changes) or has_more
+
+    async def _note_failure(self) -> None:
+        """get_changes 실패를 기록하고, 연속 임계 도달 시 전체 재대조로 폴백한다.
+
+        page_token이 크게 밀린 상태에서 네트워크 오류가 반복되면 토큰이
+        전진하지 못해 영구 정체에 빠진다. 일정 횟수 연속 실패하면
+        on_token_invalid(=run_without_state)로 강제 복구한다.
+        """
+        self._consecutive_failures += 1
+        if self._consecutive_failures < POLL_MAX_CONSECUTIVE_FAILURES:
+            return
+        logger.warning(
+            f"poller: 연속 {self._consecutive_failures}회 실패 → 전체 재대조 폴백"
+        )
+        self._consecutive_failures = 0
+        if self._on_token_invalid is not None:
+            await self._invoke_token_invalid()
 
     async def _invoke_token_invalid(self) -> None:
         try:

@@ -45,7 +45,7 @@ def state(config: SyncConfig) -> SyncState:
 @pytest.fixture
 def drive() -> MagicMock:
     mock = MagicMock()
-    mock.get_changes.return_value = ([], "tok1")
+    mock.get_changes.return_value = ([], "tok1", False)
     mock.get_initial_token.return_value = "initial_token"
     # 기본: parents 해석이 파일명을 그대로 rel_path로 돌려주도록
     # (기존 테스트는 파일을 루트에 둔다고 가정)
@@ -107,7 +107,7 @@ def test_cell_unchanged_x_unchanged_noop(
 ) -> None:
     _write(vault, "a.md", b"x", mtime=100.0)
     state.files["a.md"] = FileEntry(mtime=100.0, size=1, drive_id="id_a")
-    drive.get_changes.return_value = ([], "tok1")
+    drive.get_changes.return_value = ([], "tok1", False)
 
     actions = reconciler.run()
     assert actions == []
@@ -119,6 +119,7 @@ def test_cell_unchanged_x_new_download(
     drive.get_changes.return_value = (
         [_change("newid", name="remote_new.md")],
         "tok1",
+        False,
     )
     actions = reconciler.run()
     assert len(actions) == 1
@@ -147,6 +148,7 @@ def test_cell_unchanged_x_modified_download(
             },
         )],
         "tok1",
+        False,
     )
     actions = reconciler.run()
     assert len(actions) == 1
@@ -167,7 +169,7 @@ def test_cell_unchanged_x_deleted_cleans_state_entry(
         mtime=100.0, size=1, drive_id="id_c",
         version=VersionVector({"my_pc___": 100}),
     )
-    drive.get_changes.return_value = ([_change("id_c", removed=True)], "tok1")
+    drive.get_changes.return_value = ([_change("id_c", removed=True)], "tok1", False)
 
     actions = reconciler.run()
     # Remote deleted with version update → local gets delete_local action
@@ -184,7 +186,7 @@ def test_cell_new_x_unchanged_upload(
     reconciler: Reconciler, vault: Path, drive: MagicMock
 ) -> None:
     _write(vault, "fresh.md", b"new_local")
-    drive.get_changes.return_value = ([], "tok1")
+    drive.get_changes.return_value = ([], "tok1", False)
     actions = reconciler.run()
     assert len(actions) == 1
     assert actions[0]["type"] == "upload"
@@ -207,6 +209,7 @@ def test_cell_new_x_new_conflict(
             },
         )],
         "tok1",
+        False,
     )
 
     actions = reconciler.run()
@@ -225,7 +228,7 @@ def test_cell_modified_x_unchanged_upload(
 ) -> None:
     _write(vault, "m.md", b"new_bigger", mtime=200.0)
     state.files["m.md"] = FileEntry(mtime=100.0, size=3, drive_id="idm")
-    drive.get_changes.return_value = ([], "tok1")
+    drive.get_changes.return_value = ([], "tok1", False)
 
     actions = reconciler.run()
     assert len(actions) == 1
@@ -251,6 +254,7 @@ def test_cell_modified_x_modified_conflict(
             },
         )],
         "tok1",
+        False,
     )
 
     actions = reconciler.run()
@@ -267,7 +271,7 @@ def test_cell_modified_x_deleted_conflict(
         mtime=100.0, size=3, drive_id="idm",
         version=VersionVector({"my_pc___": 100}),
     )
-    drive.get_changes.return_value = ([_change("idm", removed=True)], "tok1")
+    drive.get_changes.return_value = ([_change("idm", removed=True)], "tok1", False)
 
     actions = reconciler.run()
     # Local was modified (version bumped) vs remote deleted (also version bumped)
@@ -286,7 +290,7 @@ def test_cell_deleted_x_unchanged_delete_remote(
         mtime=100.0, size=1, drive_id="idg",
         version=VersionVector({"my_pc___": 100}),
     )
-    drive.get_changes.return_value = ([], "tok1")
+    drive.get_changes.return_value = ([], "tok1", False)
 
     actions = reconciler.run()
     assert len(actions) == 1
@@ -312,6 +316,7 @@ def test_cell_deleted_x_modified_conflict(
             },
         )],
         "tok1",
+        False,
     )
 
     actions = reconciler.run()
@@ -327,7 +332,7 @@ def test_cell_deleted_x_deleted_noop(
         mtime=100.0, size=1, drive_id="idg",
         version=VersionVector({"my_pc___": 100}),
     )
-    drive.get_changes.return_value = ([_change("idg", removed=True)], "tok1")
+    drive.get_changes.return_value = ([_change("idg", removed=True)], "tok1", False)
 
     actions = reconciler.run()
     # Both deleted → may produce delete_local (for remote deletion)
@@ -343,7 +348,7 @@ def test_cell_deleted_x_deleted_noop(
 def test_page_token_updated_after_run(
     reconciler: Reconciler, state: SyncState, drive: MagicMock
 ) -> None:
-    drive.get_changes.return_value = ([], "brand_new_token")
+    drive.get_changes.return_value = ([], "brand_new_token", False)
     reconciler.run()
     assert state.page_token == "brand_new_token"
 
@@ -363,6 +368,7 @@ def test_idempotency_same_state_same_actions(
             },
         )],
         "tok1",
+        False,
     )
 
     first = reconciler.run()
@@ -376,6 +382,7 @@ def test_idempotency_same_state_same_actions(
             },
         )],
         "tok1",
+        False,
     )
     second = reconciler.run()
 
@@ -388,6 +395,7 @@ def test_unknown_remote_deletion_ignored(
     drive.get_changes.return_value = (
         [_change("unknown_id", removed=True)],
         "tok1",
+        False,
     )
     actions = reconciler.run()
     assert actions == []

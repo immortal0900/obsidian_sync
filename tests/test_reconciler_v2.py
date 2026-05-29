@@ -474,7 +474,7 @@ class TestSymptomPrevention:
         state.page_token = "token_old"
 
         # No remote changes
-        mock_drive.get_changes.return_value = ([], "token_new")
+        mock_drive.get_changes.return_value = ([], "token_new", False)
 
         r = Reconciler(state, mock_drive)
         actions = r.run()
@@ -498,6 +498,7 @@ class TestSymptomPrevention:
         mock_drive.get_changes.return_value = (
             [{"file_id": "r1", "removed": True}],
             "token_new",
+        False,
         )
 
         r = Reconciler(state, mock_drive)
@@ -551,6 +552,7 @@ class TestMetadataOnlySkip:
                 }
             ],
             "token_new",
+        False,
         )
 
         r = Reconciler(state, mock_drive)
